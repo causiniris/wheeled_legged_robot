@@ -248,6 +248,8 @@ end
 fprintf("Saved fit summary: %s\n", summaryFile);
 fprintf("Saved fit plot: %s\n", figureFile);
 fprintf("Input column used: %s\n", inputColumn);
+fprintf("B is physically interpretable only when it is positive and the parameter checks agree.\n");
+fprintf("The measured output is the firmware velocity signal, including its configured low-pass filter.\n");
 fprintf("Nominal parameters: Rs=%.6g ohm, Lq=%.6g H, Ke=%.6g, Kt=%.6g, J=%.6g kg*m^2\n", ...
     Rphase, Lq, Ke, Kt, Jdatasheet);
 

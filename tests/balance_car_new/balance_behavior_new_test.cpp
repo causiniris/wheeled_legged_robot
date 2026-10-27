@@ -3,26 +3,28 @@
 #include <cassert>
 #include <cmath>
 #include <iostream>
+#include "fakes/HostMpuI2C_new.h"
 #include "../../V1_06_TwoWheel_Balance_Car_new/BalanceController_new.h"
 
 void command(char c) { Serial.input.push_back(c); processSerial(); }
-void wordAt(TwoWire& bus, int address, int reg, int16_t value) {
-  bus.registers[address][reg] = static_cast<uint16_t>(value) >> 8;
-  bus.registers[address][reg + 1] = static_cast<uint16_t>(value) & 255;
-}
 void healthySetup() {
   faultLatched = false; imuReady = motorsReady = armed = false; testWheel = 0;
   leftSensor.failed = rightSensor.failed = false;
   leftDriver.failInit = rightDriver.failInit = false;
   Wire.nackAddress = Wire.shortReadAddress = Wire1.nackAddress = Wire1.shortReadAddress = -1;
   Wire.registers[0x36][0x0B] = Wire1.registers[0x36][0x0B] = 0x20;
-  Wire.registers[0x68][0x75] = 0x68;
-  wordAt(Wire, 0x68, 0x3B, 0); wordAt(Wire, 0x68, 0x3D, 0); wordAt(Wire, 0x68, 0x3F, 16384);
-  wordAt(Wire, 0x68, 0x43, 0); wordAt(Wire, 0x68, 0x45, 0); wordAt(Wire, 0x68, 0x47, 0);
+  // Neither hardware bus contains a working MPU6050. A controller accidentally
+  // using Wire/Wire1 for its IMU must fail this setup.
+  Wire.nackAddress = Wire1.nackAddress = 0x68;
+  hostMpu = HostMpuI2C{}; attachHostMpu();
+  hostMpu.registers[0x75] = 0x68;
+  hostMpu.setWord(0x3F, 16384);
   leftMotor.shaft_velocity = rightMotor.shaft_velocity = 0;
   setup();
   assert(motorsReady && imuReady && !faultLatched && !driving());
   assert(hostPins[LEFT_EN] == LOW && hostPins[RIGHT_EN] == LOW);
+  assert(hostPinModes[16] == OUTPUT_OPEN_DRAIN && hostPinModes[17] == OUTPUT_OPEN_DRAIN);
+  assert(hostMpu.registers[0x19] == 4 && hostMpu.registers[0x6B] == 1);
 }
 int main() {
   // Early initialization failure must not dereference a null motor driver.
@@ -50,8 +52,12 @@ int main() {
   assert(faultLatched && !driving() && !hostPins[LEFT_EN] && !hostPins[RIGHT_EN]);
   Wire.shortReadAddress = -1; command('A'); assert(!armed); // errors stay latched
 
-  healthySetup(); command('A'); Wire.shortReadAddress = 0x68; hostTimeUs += 5000; loop();
+  healthySetup(); command('A'); hostMpu.present = false; hostTimeUs += 5000; loop();
   assert(faultLatched && !driving() && !hostPins[LEFT_EN] && !hostPins[RIGHT_EN]);
+
+  healthySetup(); command('A'); hostMpu.holdClockLow = true; hostTimeUs += 5000; loop();
+  assert(faultLatched && !driving() && !hostPins[LEFT_EN] && !hostPins[RIGHT_EN]);
+  assert(mpuBus.error() == SoftwareI2C_new::Error::timeout);
 
   healthySetup(); command('A'); hostTimeUs += MAX_CONTROL_GAP_US + 1; loop();
   assert(faultLatched && !armed && !hostPins[LEFT_EN] && !hostPins[RIGHT_EN]);
@@ -60,7 +66,7 @@ int main() {
   assert(!driving() && !hostPins[LEFT_EN] && !hostPins[RIGHT_EN]);
 
   healthySetup(); command('A'); pitchAngleDeg = 45;
-  wordAt(Wire, 0x68, 0x3D, 11585); wordAt(Wire, 0x68, 0x3F, 11585);
+  hostMpu.setWord(0x3D, 11585); hostMpu.setWord(0x3F, 11585);
   hostTimeUs += 5000; loop();
   assert(!driving() && !hostPins[LEFT_EN] && !hostPins[RIGHT_EN]);
 

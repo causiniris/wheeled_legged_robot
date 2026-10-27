@@ -16,12 +16,14 @@
 #include <Wire.h>
 #include <math.h>
 #include "BalanceMath_new.h"
+#include "SoftwareI2C_new.h"
 
 namespace {
 constexpr int LEFT_IN1 = 32, LEFT_IN2 = 33, LEFT_IN3 = 25, LEFT_EN = 12;
 constexpr int RIGHT_IN1 = 14, RIGHT_IN2 = 27, RIGHT_IN3 = 26, RIGHT_EN = 13;
 constexpr int LEFT_I2C_SDA = 21, LEFT_I2C_SCL = 22;
 constexpr int RIGHT_I2C_SDA = 19, RIGHT_I2C_SCL = 18;
+constexpr int MPU_I2C_SDA = 16, MPU_I2C_SCL = 17; // Dedicated software I2C.
 constexpr uint8_t MPU6050_ADDRESS = 0x68;  // AD0=GND; use 0x69 if AD0=3.3V.
 constexpr int POLE_PAIRS = 7;              // Inherited homework value; verify both motors.
 constexpr float SUPPLY_VOLTAGE = 12.0f;
@@ -108,6 +110,7 @@ class CheckedAS5600 : public Sensor {
 };
 
 CheckedAS5600 leftSensor(Wire), rightSensor(Wire1);
+SoftwareI2C_new mpuBus(MPU_I2C_SDA, MPU_I2C_SCL);
 BLDCMotor leftMotor(POLE_PAIRS), rightMotor(POLE_PAIRS);
 BLDCDriver3PWM leftDriver(LEFT_IN1, LEFT_IN2, LEFT_IN3, LEFT_EN);
 BLDCDriver3PWM rightDriver(RIGHT_IN1, RIGHT_IN2, RIGHT_IN3, RIGHT_EN);
@@ -121,6 +124,7 @@ bool imuReady = false, faultLatched = false, armed = false, speedAssist = false;
 uint8_t testWheel = 0;
 uint32_t testStartMs = 0, lastControlUs = 0, lastImuUs = 0;
 uint32_t lastTelemetryMs = 0, lastMagnetCheckMs = 0;
+uint32_t lastFocUs = 0, maxFocGapUs = 0;
 
 bool driving() { return armed || testWheel != 0; }
 void stopMotors(const char* reason) {
@@ -156,7 +160,7 @@ float accelPitch(const ImuSample& s) {
 }
 bool readImu(ImuSample& s) {
   uint8_t data[14];
-  if (!readRegisters(Wire, MPU6050_ADDRESS, 0x3B, data, 14)) return false;
+  if (!mpuBus.readRegisters(MPU6050_ADDRESS, 0x3B, data, 14)) return false;
   s.ax = signed16(data); s.ay = signed16(data + 2); s.az = signed16(data + 4);
   s.gx = signed16(data + 8); s.gy = signed16(data + 10); s.gz = signed16(data + 12);
   const float norm2 = float(s.ax) * s.ax + float(s.ay) * s.ay + float(s.az) * s.az;
@@ -168,13 +172,11 @@ bool readImu(ImuSample& s) {
          abs(int(s.gx)) < 32700 && abs(int(s.gy)) < 32700 && abs(int(s.gz)) < 32700;
 }
 bool writeMpu(uint8_t reg, uint8_t value) {
-  Wire.beginTransmission(MPU6050_ADDRESS);
-  Wire.write(reg); Wire.write(value);
-  return Wire.endTransmission() == 0;
+  return mpuBus.writeRegister(MPU6050_ADDRESS, reg, value);
 }
 bool initializeImu() {
   uint8_t identity = 0;
-  if (!readRegisters(Wire, MPU6050_ADDRESS, 0x75, &identity, 1) || identity != 0x68) return false;
+  if (!mpuBus.readRegisters(MPU6050_ADDRESS, 0x75, &identity, 1) || identity != 0x68) return false;
   if (!writeMpu(0x6B, 0x01) || // wake, X gyro PLL clock
       !writeMpu(0x1A, 0x03) || // DLPF 44 Hz gyro
       !writeMpu(0x19, 0x04) || // 1 kHz / (4 + 1) = 200 Hz
@@ -188,7 +190,7 @@ bool calibrateImu() {
   constexpr int SAMPLES = 300;
   double gyroSum = 0, gyroSquares = 0, sinSum = 0, cosSum = 0;
   float minAngle = 0, maxAngle = 0, firstAngle = 0;
-  Serial.println("CALIBRATE: hold upright and STILL for 1.5 seconds; motors are disabled.");
+  Serial.println("CALIBRATE: hold upright and STILL for about 2 seconds; motors are disabled.");
   for (int i = 0; i < SAMPLES; ++i) {
     ImuSample s{};
     if (!readImu(s)) return false;
@@ -272,6 +274,7 @@ bool canStart() {
     fault("AS5600 magnet or I2C failure"); return false;
   }
   speedIntegral = speedFiltered = speedLean = balanceVoltage = 0;
+  lastFocUs = maxFocGapUs = 0;
   leftMotor.voltage.q = leftMotor.voltage.d = rightMotor.voltage.q = rightMotor.voltage.d = 0;
   leftMotor.target = rightMotor.target = 0;
   return true;
@@ -341,13 +344,16 @@ void printTelemetry() {
   lastTelemetryMs = now;
   char line[192];
   const int length = snprintf(line, sizeof(line),
-    "pitch=%.2f set=%.2f rate=%.2f wl=%.2f wr=%.2f u=%.2f lean=%.2f A=%d T=%u F=%d\n",
+    "pitch=%.2f set=%.2f rate=%.2f wl=%.2f wr=%.2f u=%.2f lean=%.2f A=%d T=%u F=%d imu_us=%lu foc_us=%lu\n",
     pitchAngleDeg, balanceSetpointDeg, pitchRateDegPerSec,
     LEFT_MOTOR_SIGN * leftMotor.shaft_velocity, RIGHT_MOTOR_SIGN * rightMotor.shaft_velocity,
-    balanceVoltage, speedLean, armed, testWheel, faultLatched);
+    balanceVoltage, speedLean, armed, testWheel, faultLatched,
+    static_cast<unsigned long>(mpuBus.durationUs()), static_cast<unsigned long>(maxFocGapUs));
   // Drop telemetry if full; never wait for the UART while balancing.
-  if (length > 0 && length < static_cast<int>(sizeof(line)) && Serial.availableForWrite() >= length)
+  if (length > 0 && length < static_cast<int>(sizeof(line)) && Serial.availableForWrite() >= length) {
     Serial.write(reinterpret_cast<const uint8_t*>(line), length);
+    maxFocGapUs = 0;
+  }
 }
 } // namespace
 
@@ -361,6 +367,7 @@ void setup() {
   delay(500);
   Serial.println("V1_06_TwoWheel_Balance_Car_new / ESP32 / SimpleFOC 2.3.3");
   Serial.println("Left PWM 32/33/25 EN12 I2C21/22; Right PWM14/27/26 EN13 I2C19/18");
+  Serial.println("MPU6050 ONLY: software I2C SDA16/SCL17, AD0=GND, pull-ups to 3.3V");
   Serial.println("Commands: L/R=short wheel test A=balance X=stop C=calibrate +/-=trim");
   Serial.println("Disarmed tuning: 1/0=Kp +/-0.5, 3/2=Kd +/-0.02, V=speed assist, ?=settings");
   if (!Wire.begin(LEFT_I2C_SDA, LEFT_I2C_SCL, 400000) ||
@@ -368,11 +375,13 @@ void setup() {
     fault("I2C initialization"); return;
   }
   Wire.setTimeOut(3); Wire1.setTimeOut(3);
+  if (!mpuBus.begin()) { fault(mpuBus.errorText()); return; }
   if (!leftSensor.magnetHealthy() || !rightSensor.magnetHealthy()) {
     fault("AS5600 missing or magnet too weak/strong"); return;
   }
   leftSensor.init(); rightSensor.init();
   if (leftSensor.failed || rightSensor.failed || !initializeImu()) {
+    if (mpuBus.error() != SoftwareI2C_new::Error::none) Serial.println(mpuBus.errorText());
     fault("sensor initialization / MPU6050 identity"); return;
   }
   if (!initializeMotor(leftMotor, leftDriver, leftSensor, leftLinked, "LEFT") ||
@@ -400,6 +409,10 @@ void loop() {
   if (testWheel != 0 && millis() - testStartMs >= TEST_DURATION_MS) stopMotors("wheel test complete");
 
   // Sensor updates also run while disarmed, so wheel telemetry is never stale.
+  const uint32_t focUs = micros();
+  if (driving() && lastFocUs != 0)
+    maxFocGapUs = (focUs - lastFocUs > maxFocGapUs) ? focUs - lastFocUs : maxFocGapUs;
+  lastFocUs = focUs;
   leftMotor.loopFOC();
   if (leftSensor.failed) { fault("LEFT AS5600 I2C read"); return; }
   rightMotor.loopFOC();
@@ -418,7 +431,10 @@ void loop() {
     if (driving() && elapsed > MAX_CONTROL_GAP_US) { fault("control loop overdue"); return; }
     lastControlUs = nowUs;
     const float dt = elapsed * 1.0e-6f;
-    if (!updatePitch(dt)) { fault("MPU6050 read / range"); return; }
+    if (!updatePitch(dt)) {
+      fault(mpuBus.error() == SoftwareI2C_new::Error::none ? "MPU6050 data range" : mpuBus.errorText());
+      return;
+    }
     if (driving() && fabsf(BalanceMath::wrapDeg(pitchAngleDeg-calibratedUprightDeg)) > MAX_TILT_DEG)
       stopMotors("tilt limit");
     if (armed) updateBalanceControl(dt);
