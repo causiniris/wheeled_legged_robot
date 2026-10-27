@@ -1,0 +1,20 @@
+MOT: Enable driver.
+Motor init success.
+Running initFOC...
+MOT: Align sensor.
+MOT: sensor dir: CW
+MOT: PP check: OK!
+Skip dir calib.
+MOT: Zero elec. angle: 4.31
+ERR-MOT: No current sense.
+MOT: Ready.
+FOC init done.
+
+Motor ready.
+Commands:
+T3      -> slow closed-loop rotate
+T6.28   -> forward, about 1 rotation/s
+T0      -> stop
+T-6.28  -> reverse, about 1 rotation/s
+L4      -> set voltage limit to 4V
+L5      -> set voltage limit to 5V

@@ -1,0 +1,6 @@
+*.md text eol=lf
+*.ino text eol=lf
+*.ini text eol=lf
+*.txt text eol=lf
+*.png binary
+*.mp4 binary
