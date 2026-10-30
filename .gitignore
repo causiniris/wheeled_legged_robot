@@ -21,6 +21,10 @@ dist/
 *.map
 *.hex
 
+# MATLAB / Simulink generated caches
+**/slprj/
+*.slxc
+
 # OS files
 Thumbs.db
 .DS_Store

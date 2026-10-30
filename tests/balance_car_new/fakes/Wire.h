@@ -4,6 +4,7 @@ class TwoWire {
  public:
   uint8_t registers[128][256]{};
   int nackAddress = -1, shortReadAddress = -1;
+  int nackCode = 2;
   bool begin(int, int, int) { return true; }
   void setTimeOut(int) {}
   void beginTransmission(uint8_t address) { address_ = address; first_ = true; }
@@ -11,7 +12,7 @@ class TwoWire {
     if (first_) { reg_ = value; first_ = false; }
     else registers[address_][reg_] = value;
   }
-  int endTransmission(bool = true) { return address_ == nackAddress ? 4 : 0; }
+  int endTransmission(bool = true) { return address_ == nackAddress ? nackCode : 0; }
   size_t requestFrom(uint8_t address, uint8_t length, uint8_t) {
     input_.clear();
     const int count = address == shortReadAddress ? length - 1 : length;
