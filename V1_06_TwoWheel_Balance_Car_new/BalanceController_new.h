@@ -66,13 +66,23 @@ void cutEnablePins() {
   digitalWrite(RIGHT_EN, LOW);
 }
 
+struct I2cReadDiagnostic {
+  uint8_t reg = 0, expected = 0, writeCode = 0;
+  size_t received = 0;
+  int available = 0;
+};
 bool readRegisters(TwoWire& bus, uint8_t address, uint8_t reg,
-                   uint8_t* data, uint8_t length) {
+                   uint8_t* data, uint8_t length, I2cReadDiagnostic& diagnostic) {
+  diagnostic = {};
+  diagnostic.reg = reg;
+  diagnostic.expected = length;
   bus.beginTransmission(address);
   bus.write(reg);
-  if (bus.endTransmission(false) != 0) return false;
-  const size_t received = bus.requestFrom(address, length, static_cast<uint8_t>(true));
-  if (received != length || bus.available() < length) {
+  diagnostic.writeCode = bus.endTransmission(false);
+  if (diagnostic.writeCode != 0) return false;
+  diagnostic.received = bus.requestFrom(address, length, static_cast<uint8_t>(true));
+  diagnostic.available = bus.available();
+  if (diagnostic.received != length || diagnostic.available < length) {
     while (bus.available()) bus.read();
     return false;
   }
@@ -84,32 +94,76 @@ bool readRegisters(TwoWire& bus, uint8_t address, uint8_t reg,
 // a short data read. This adapter rejects both and keeps errors latched.
 class CheckedAS5600 : public Sensor {
  public:
+  enum class Failure { none, i2c, magnet };
   explicit CheckedAS5600(TwoWire& bus) : bus_(bus) {}
   void init() override { Sensor::init(); }
   bool failed = false;
+  Failure failure = Failure::none;
+  I2cReadDiagnostic diagnostic;
+  uint8_t magnetStatus = 0;
   bool magnetHealthy() {
-    uint8_t status = 0;
-    if (!readRegisters(bus_, 0x36, 0x0B, &status, 1) || (status & 0x38) != 0x20) {
-      failed = true;
-      cutEnablePins();
-      return false;
-    }
-    return !failed;
+    if (failed) { cutEnablePins(); return false; }
+    if (!readRegisters(bus_, 0x36, 0x0B, &magnetStatus, 1, diagnostic))
+      return latchFailure(Failure::i2c);
+    if ((magnetStatus & 0x38) != 0x20) return latchFailure(Failure::magnet);
+    failure = Failure::none;
+    return true;
   }
   float getSensorAngle() override {
+    if (failed) { cutEnablePins(); return -1.0f; }
     uint8_t data[2];
-    if (failed || !readRegisters(bus_, 0x36, 0x0C, data, 2)) {
-      failed = true;
-      cutEnablePins();
+    if (!readRegisters(bus_, 0x36, 0x0C, data, 2, diagnostic)) {
+      latchFailure(Failure::i2c);
       return -1.0f; // Sensor::update ignores this sample instead of inventing an angle.
     }
     return (((data[0] & 0x0F) << 8) | data[1]) * (_2PI / 4096.0f);
   }
  private:
   TwoWire& bus_;
+  bool latchFailure(Failure reason) {
+    failed = true;
+    failure = reason;
+    cutEnablePins(); // No serial work until both power stages have been disabled.
+    return false;
+  }
 };
 
 CheckedAS5600 leftSensor(Wire), rightSensor(Wire1);
+
+void printEncoderDiagnostic(const char* side, int sda, int scl, const CheckedAS5600& sensor) {
+  Serial.printf("AS5600 %s SDA%d/SCL%d addr=0x36: ", side, sda, scl);
+  if (sensor.failure == CheckedAS5600::Failure::i2c) {
+    const I2cReadDiagnostic& d = sensor.diagnostic;
+    if (d.writeCode != 0) {
+      const char* reason = d.writeCode == 2 ? "address NACK" :
+                           d.writeCode == 3 ? "data NACK" :
+                           d.writeCode == 4 ? "bus error" :
+                           d.writeCode == 5 ? "timeout" : "Wire error";
+      Serial.printf("I2C_WRITE_FAILED reg=0x%02X wire_code=%u (%s)\n",
+                    unsigned(d.reg), unsigned(d.writeCode), reason);
+    } else {
+      Serial.printf("I2C_SHORT_READ reg=0x%02X received=%u available=%d expected=%u\n",
+                    unsigned(d.reg), unsigned(d.received), d.available, unsigned(d.expected));
+    }
+    return;
+  }
+  const uint8_t status = sensor.magnetStatus;
+  const char* reason = "OK";
+  if (sensor.failure == CheckedAS5600::Failure::magnet) {
+    reason = (status & 0x18) == 0x18 ? "MAGNET_STATUS_INVALID" :
+             (status & 0x10) ? "MAGNET_TOO_WEAK" :
+             (status & 0x08) ? "MAGNET_TOO_STRONG" : "MAGNET_NOT_DETECTED";
+  }
+  Serial.printf("%s STATUS=0x%02X MD=%d ML=%d MH=%d\n", reason, unsigned(status),
+                (status & 0x20) != 0, (status & 0x10) != 0, (status & 0x08) != 0);
+}
+void printEncoderDiagnostics(bool includeHealthy = false) {
+  if (includeHealthy || leftSensor.failed)
+    printEncoderDiagnostic("LEFT", LEFT_I2C_SDA, LEFT_I2C_SCL, leftSensor);
+  if (includeHealthy || rightSensor.failed)
+    printEncoderDiagnostic("RIGHT", RIGHT_I2C_SDA, RIGHT_I2C_SCL, rightSensor);
+}
+
 SoftwareI2C_new mpuBus(MPU_I2C_SDA, MPU_I2C_SCL);
 BLDCMotor leftMotor(POLE_PAIRS), rightMotor(POLE_PAIRS);
 BLDCDriver3PWM leftDriver(LEFT_IN1, LEFT_IN2, LEFT_IN3, LEFT_EN);
@@ -149,6 +203,18 @@ void fault(const char* reason) {
   stopMotors(reason);
   if (!faultLatched) Serial.printf("FAULT: %s. Check wiring/sensors, then reset.\n", reason);
   faultLatched = true;
+}
+bool checkEncoderMagnets(bool logHealthy = false) {
+  // Evaluate both sides, even if LEFT fails. A failed read immediately cuts EN.
+  const bool leftHealthy = leftSensor.magnetHealthy();
+  const bool rightHealthy = rightSensor.magnetHealthy();
+  if (!leftHealthy || !rightHealthy) {
+    fault("AS5600 check failed; see LEFT/RIGHT details below");
+    printEncoderDiagnostics(true);
+    return false;
+  }
+  if (logHealthy) printEncoderDiagnostics(true);
+  return true;
 }
 int16_t signed16(const uint8_t* data) {
   return static_cast<int16_t>((static_cast<uint16_t>(data[0]) << 8) | data[1]);
@@ -270,9 +336,7 @@ bool canStart() {
     Serial.println("Cannot start: hold upright, stop wheels, and wait for fresh IMU readings.");
     return false;
   }
-  if (!leftSensor.magnetHealthy() || !rightSensor.magnetHealthy()) {
-    fault("AS5600 magnet or I2C failure"); return false;
-  }
+  if (!checkEncoderMagnets()) return false;
   speedIntegral = speedFiltered = speedLean = balanceVoltage = 0;
   lastFocUs = maxFocGapUs = 0;
   leftMotor.voltage.q = leftMotor.voltage.d = rightMotor.voltage.q = rightMotor.voltage.d = 0;
@@ -365,7 +429,7 @@ void setup() {
   Serial.setTxBufferSize(512);
   Serial.begin(115200);
   delay(500);
-  Serial.println("V1_06_TwoWheel_Balance_Car_new / ESP32 / SimpleFOC 2.3.3");
+  Serial.println("V1_06_TwoWheel_Balance_Car_new / ESP32 / SimpleFOC 2.3.3 / encoder diagnostics v2");
   Serial.println("Left PWM 32/33/25 EN12 I2C21/22; Right PWM14/27/26 EN13 I2C19/18");
   Serial.println("MPU6050 ONLY: software I2C SDA16/SCL17, AD0=GND, pull-ups to 3.3V");
   Serial.println("Commands: L/R=short wheel test A=balance X=stop C=calibrate +/-=trim");
@@ -376,17 +440,19 @@ void setup() {
   }
   Wire.setTimeOut(3); Wire1.setTimeOut(3);
   if (!mpuBus.begin()) { fault(mpuBus.errorText()); return; }
-  if (!leftSensor.magnetHealthy() || !rightSensor.magnetHealthy()) {
-    fault("AS5600 missing or magnet too weak/strong"); return;
-  }
+  if (!checkEncoderMagnets(true)) return;
   leftSensor.init(); rightSensor.init();
-  if (leftSensor.failed || rightSensor.failed || !initializeImu()) {
+  if (leftSensor.failed || rightSensor.failed) {
+    fault("AS5600 angle initialization"); printEncoderDiagnostics(); return;
+  }
+  if (!initializeImu()) {
     if (mpuBus.error() != SoftwareI2C_new::Error::none) Serial.println(mpuBus.errorText());
     fault("sensor initialization / MPU6050 identity"); return;
   }
   if (!initializeMotor(leftMotor, leftDriver, leftSensor, leftLinked, "LEFT") ||
       !initializeMotor(rightMotor, rightDriver, rightSensor, rightLinked, "RIGHT")) {
-    fault("motor alignment; check phases, magnets, supply and pole pairs"); return;
+    fault("motor alignment; check phases, magnets, supply and pole pairs");
+    printEncoderDiagnostics(); return;
   }
   motorsReady = true;
   stopMotors("startup");
@@ -414,9 +480,9 @@ void loop() {
     maxFocGapUs = (focUs - lastFocUs > maxFocGapUs) ? focUs - lastFocUs : maxFocGapUs;
   lastFocUs = focUs;
   leftMotor.loopFOC();
-  if (leftSensor.failed) { fault("LEFT AS5600 I2C read"); return; }
+  if (leftSensor.failed) { fault("LEFT AS5600 I2C read"); printEncoderDiagnostics(); return; }
   rightMotor.loopFOC();
-  if (rightSensor.failed) { fault("RIGHT AS5600 I2C read"); return; }
+  if (rightSensor.failed) { fault("RIGHT AS5600 I2C read"); printEncoderDiagnostics(); return; }
   // move() refreshes shaft_velocity even while disabled, using the latest sensor.
   leftMotor.move(LEFT_MOTOR_SIGN * (armed ? balanceVoltage : (testWheel == 1 ? TEST_VOLTAGE : 0)));
   rightMotor.move(RIGHT_MOTOR_SIGN * (armed ? balanceVoltage : (testWheel == 2 ? TEST_VOLTAGE : 0)));
@@ -441,9 +507,7 @@ void loop() {
   }
   if (millis() - lastMagnetCheckMs >= 100) {
     lastMagnetCheckMs = millis();
-    if (!leftSensor.magnetHealthy() || !rightSensor.magnetHealthy()) {
-      fault("AS5600 magnet status / I2C"); return;
-    }
+    if (!checkEncoderMagnets()) return;
   }
   processSerial();
   printTelemetry();

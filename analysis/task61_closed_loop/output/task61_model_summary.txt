@@ -1,0 +1,17 @@
+Task 6.1 closed-loop simulation summary
+Generated: 2026-10-29 20:42:49
+
+Identification summary: C:\Users\yanya\Desktop\控制原理\ESP32-BLDC-Motor-Control-with-SimpleFOC\logs\motor_step_D_0.1_0.2_0.4_0.6_second_order_b_summary.csv
+Plant input: SimpleFOC q-axis voltage Uq [V]
+Plant output: shaft speed omega [rad/s]
+omega/Uq = 355073.588445 / (s^2 + 227.372595529*s + 18592.76093)
+DC gain: 19.0974105343 rad/s/V
+Poles: [-113.6862978+75.28736036i;-113.6862978-75.28736036i]
+
+Reference: 6.28 rad/s
+Step time: 0.5 s
+Voltage limit: +/- 3 V
+Sample interval: 0.001 s
+
+PI-A_mild: Kp=0.08, Ki=0.5, rise=0.352 s, settle=0.773 s, overshoot=0%, steady error=2.25645e-07 rad/s, peak Uq=0.502923 V
+PI-B_existing: Kp=0.15, Ki=1, rise=0.009 s, settle=0.504 s, overshoot=0%, steady error=1.09952e-09 rad/s, peak Uq=0.943047 V
