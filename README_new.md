@@ -10,6 +10,7 @@
 | 驱动占空比标定 | `V1_04_Driver_Calibration/V1_04_Driver_Calibration.ino` | `driver_calibration` |
 | 电压阶跃辨识 | `V1_05_Identification_Step/V1_05_Identification_Step.ino` | `identification_step` |
 | 双轮自平衡（MPU6050 + 双 AS5600） | `V1_06_TwoWheel_Balance_Car_new/V1_06_TwoWheel_Balance_Car_new.ino` | `balance_car_new` |
+| 双电机同时转动测试（双 AS5600，无 MPU6050） | `V1_07_DualMotor_Test_new/V1_07_DualMotor_Test_new.ino` | `dual_motor_test_new` |
 
 ## 编译与烧录
 
@@ -26,9 +27,11 @@ pio run -e closedloop_velocity_test_new
 pio run -e driver_calibration
 pio run -e identification_step
 pio run -e balance_car_new
+pio run -e dual_motor_test_new
 
 pio run -e sensor_test_new -t upload
 pio run -e balance_car_new -t upload
+pio run -e dual_motor_test_new -t upload
 pio device monitor -b 115200
 ```
 
@@ -107,7 +110,23 @@ pio run -e balance_car_new -t upload
 pio device monitor -e balance_car_new -b 115200
 ```
 
-## 5. 电机模型辨识作业新增程序
+## 5. 双电机同时转动测试
+
+`dual_motor_test_new` 是独立的双轮测试程序，不初始化或读取 MPU6050，也不修改 `balance_car_new`。接线与平衡程序的两路电机和两只 AS5600 相同。
+
+首次运行必须支撑车体并架空两个车轮。程序先检查左右 AS5600 的 I²C 通信和磁铁状态，再依次执行左右电机 FOC 对齐；对齐过程本身会使车轮转动。两路均成功后，程序自动以 0.5 V q 轴电压让两个轮子按车辆前进方向持续转动。
+
+- 串口发送 `X` 或 `x` 会关闭两路输出和 EN；本次上电不能重新启动，需复位 ESP32。
+- 编码器通信、磁铁状态、无效转速或超过 30 rad/s 时也会锁定停机。
+- 0.5 V 是电压指令，不是电流限制。运行前仍需核对 7 极对、12 V 电源、相线和实际转向。
+
+```text
+pio run -e dual_motor_test_new
+pio run -e dual_motor_test_new -t upload
+pio device monitor -e dual_motor_test_new -b 115200
+```
+
+## 6. 电机模型辨识作业新增程序
 
 `driver_calibration` 用于作业 4.1。测试时必须断开电机，通过 `D0.1` 至 `D0.8` 命令让 M1 相对 M2 输出固定占空比 PWM，记录实测母线电压和 M1-M2 平均电压。
 
