@@ -16,6 +16,7 @@ foreach ($scenario in @(
   'encoder-failure',
   'magnet-failure',
   'serial-stop',
+  'startup-stop',
   'runtime-encoder-failure',
   'overspeed'
 )) {

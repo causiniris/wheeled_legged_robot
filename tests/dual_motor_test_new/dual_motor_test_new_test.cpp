@@ -10,6 +10,8 @@ void healthyEncoders() {
   Wire1.registers[0x36][0x0B] = 0x20;
 }
 
+void queueStopDuringAlignment() { Serial.input.push_back('X'); }
+
 int main(int argc, char** argv) {
   assert(argc == 2);
   const std::string scenario = argv[1];
@@ -35,6 +37,12 @@ int main(int argc, char** argv) {
     setup();
     Serial.input.push_back('X');
     loop();
+    assert(!running && !leftMotor.enabled && !rightMotor.enabled);
+    assert(hostPins[LEFT_EN] == LOW && hostPins[RIGHT_EN] == LOW);
+  } else if (scenario == "startup-stop") {
+    hostInitFocHook = queueStopDuringAlignment;
+    setup();
+    assert(hostInitFocCalls == 1);
     assert(!running && !leftMotor.enabled && !rightMotor.enabled);
     assert(hostPins[LEFT_EN] == LOW && hostPins[RIGHT_EN] == LOW);
   } else if (scenario == "runtime-encoder-failure") {

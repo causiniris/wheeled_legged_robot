@@ -114,6 +114,7 @@ BLDCDriver3PWM leftDriver(LEFT_IN1, LEFT_IN2, LEFT_IN3, LEFT_EN);
 BLDCDriver3PWM rightDriver(RIGHT_IN1, RIGHT_IN2, RIGHT_IN3, RIGHT_EN);
 bool leftLinked = false, rightLinked = false;
 bool running = false, faultLatched = false;
+volatile bool stopRequested = false;
 uint32_t lastMagnetCheckMs = 0, lastTelemetryMs = 0;
 
 void printEncoderDiagnostic(const char* side, int sda, int scl,
@@ -176,6 +177,42 @@ void fault(const char* reason) {
   faultLatched = true;
 }
 
+void pollStopRequest() {
+  for (int n = 0; n < 16 && Serial.available() > 0; ++n) {
+    const char c = Serial.read();
+    if (c == 'X' || c == 'x') {
+      stopRequested = true;
+      cutEnablePins();
+    }
+  }
+}
+
+#if defined(ARDUINO_ARCH_ESP32)
+void serialStopTask(void*) {
+  for (;;) {
+    pollStopRequest();
+    if (stopRequested) cutEnablePins();
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+}
+
+bool startStopMonitor() {
+  return xTaskCreatePinnedToCore(serialStopTask, "motor-stop", 2048, nullptr, 2,
+                                nullptr, 0) == pdPASS;
+}
+#else
+bool startStopMonitor() { return true; }
+#endif
+
+bool stopIfRequested() {
+#if !defined(ARDUINO_ARCH_ESP32)
+  pollStopRequest();
+#endif
+  if (!stopRequested) return false;
+  stopMotors("serial X");
+  return true;
+}
+
 bool checkEncoderMagnets(bool logHealthy = false) {
   const bool leftHealthy = leftSensor.magnetHealthy();
   const bool rightHealthy = rightSensor.magnetHealthy();
@@ -190,6 +227,7 @@ bool checkEncoderMagnets(bool logHealthy = false) {
 
 bool initializeMotor(BLDCMotor& motor, BLDCDriver3PWM& driver,
                      CheckedAS5600& sensor, bool& linked, const char* label) {
+  if (stopIfRequested()) return false;
   motor.linkSensor(&sensor);
   driver.voltage_power_supply = SUPPLY_VOLTAGE;
   driver.voltage_limit = DRIVER_VOLTAGE_LIMIT;
@@ -205,6 +243,7 @@ bool initializeMotor(BLDCMotor& motor, BLDCDriver3PWM& driver,
   motor.voltage_sensor_align = 2.0f;
   motor.LPF_velocity.Tf = 0.02f;
   motor.init();
+  if (stopIfRequested()) return false;
   if (motor.motor_status != FOCMotorStatus::motor_uncalibrated) return false;
 
   Serial.printf("%s FOC alignment: keep wheel free; it WILL move.\n", label);
@@ -212,21 +251,12 @@ bool initializeMotor(BLDCMotor& motor, BLDCDriver3PWM& driver,
   motor.disable();
   motor.target = 0;
   motor.voltage.q = motor.voltage.d = 0;
+  if (stopIfRequested()) return false;
   if (!aligned || sensor.failed) return false;
 
   Serial.printf("%s ready: sensor_direction=%d, electrical_zero=%.4f\n",
                 label, static_cast<int>(motor.sensor_direction), motor.zero_electric_angle);
   return true;
-}
-
-void processSerial() {
-  for (int n = 0; n < 16 && Serial.available() > 0; ++n) {
-    const char c = Serial.read();
-    if (c == 'X' || c == 'x') {
-      stopMotors("serial X");
-      return;
-    }
-  }
 }
 
 void printTelemetry() {
@@ -249,7 +279,12 @@ void setup() {
 
   Serial.setTxBufferSize(512);
   Serial.begin(115200);
+  if (!startStopMonitor()) {
+    fault("serial stop monitor task");
+    return;
+  }
   delay(500);
+  if (stopIfRequested()) return;
   Serial.println("V1_07_DualMotor_Test_new / ESP32 / SimpleFOC 2.3.3");
   Serial.println("Support chassis; both wheels must be off the floor.");
   Serial.println("Left PWM32/33/25 EN12 I2C21/22; Right PWM14/27/26 EN13 I2C19/18");
@@ -272,15 +307,24 @@ void setup() {
     return;
   }
 
-  if (!initializeMotor(leftMotor, leftDriver, leftSensor, leftLinked, "LEFT") ||
-      !initializeMotor(rightMotor, rightDriver, rightSensor, rightLinked, "RIGHT")) {
+  if (!initializeMotor(leftMotor, leftDriver, leftSensor, leftLinked, "LEFT")) {
+    if (stopRequested) return;
+    fault("motor alignment; check phases, magnets, supply and pole pairs");
+    printEncoderDiagnostics();
+    return;
+  }
+  if (!initializeMotor(rightMotor, rightDriver, rightSensor, rightLinked, "RIGHT")) {
+    if (stopRequested) return;
     fault("motor alignment; check phases, magnets, supply and pole pairs");
     printEncoderDiagnostics();
     return;
   }
 
+  if (stopIfRequested()) return;
   leftMotor.enable();
+  if (stopIfRequested()) return;
   rightMotor.enable();
+  if (stopIfRequested()) return;
   running = true;
   leftMotor.move(LEFT_MOTOR_SIGN * TEST_VOLTAGE);
   rightMotor.move(RIGHT_MOTOR_SIGN * TEST_VOLTAGE);
@@ -289,7 +333,10 @@ void setup() {
 }
 
 void loop() {
-  processSerial();
+#if !defined(ARDUINO_ARCH_ESP32)
+  pollStopRequest();
+#endif
+  if (stopRequested) stopMotors("serial X");
   if (!running || faultLatched) {
     delay(2);
     return;
