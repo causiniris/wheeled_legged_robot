@@ -1,16 +1,26 @@
 #include <cassert>
+#include <atomic>
 #include <cmath>
 #include <iostream>
 #include <string>
+#include <type_traits>
 
 #include "../../V1_07_DualMotor_Test_new/V1_07_DualMotor_Test_new.ino"
+
+static_assert(std::is_same<decltype(stopRequested), std::atomic<bool>>::value,
+              "The cross-core stop latch must be atomic");
 
 void healthyEncoders() {
   Wire.registers[0x36][0x0B] = 0x20;
   Wire1.registers[0x36][0x0B] = 0x20;
 }
 
-void queueStopDuringAlignment() { Serial.input.push_back('X'); }
+void queueStopDuringAlignment() {
+  Serial.input.push_back('X');
+  pollStopRequest();
+  assert(stopRequested.load(std::memory_order_acquire));
+  assert(hostPins[LEFT_EN] == LOW && hostPins[RIGHT_EN] == LOW);
+}
 
 int main(int argc, char** argv) {
   assert(argc == 2);

@@ -6,6 +6,7 @@
 #include <Arduino.h>
 #include <SimpleFOC.h>
 #include <Wire.h>
+#include <atomic>
 #include <math.h>
 
 namespace {
@@ -114,7 +115,7 @@ BLDCDriver3PWM leftDriver(LEFT_IN1, LEFT_IN2, LEFT_IN3, LEFT_EN);
 BLDCDriver3PWM rightDriver(RIGHT_IN1, RIGHT_IN2, RIGHT_IN3, RIGHT_EN);
 bool leftLinked = false, rightLinked = false;
 bool running = false, faultLatched = false;
-volatile bool stopRequested = false;
+std::atomic<bool> stopRequested{false};
 uint32_t lastMagnetCheckMs = 0, lastTelemetryMs = 0;
 
 void printEncoderDiagnostic(const char* side, int sda, int scl,
@@ -181,7 +182,7 @@ void pollStopRequest() {
   for (int n = 0; n < 16 && Serial.available() > 0; ++n) {
     const char c = Serial.read();
     if (c == 'X' || c == 'x') {
-      stopRequested = true;
+      stopRequested.store(true, std::memory_order_release);
       cutEnablePins();
     }
   }
@@ -191,7 +192,7 @@ void pollStopRequest() {
 void serialStopTask(void*) {
   for (;;) {
     pollStopRequest();
-    if (stopRequested) cutEnablePins();
+    if (stopRequested.load(std::memory_order_acquire)) cutEnablePins();
     vTaskDelay(pdMS_TO_TICKS(1));
   }
 }
@@ -208,7 +209,7 @@ bool stopIfRequested() {
 #if !defined(ARDUINO_ARCH_ESP32)
   pollStopRequest();
 #endif
-  if (!stopRequested) return false;
+  if (!stopRequested.load(std::memory_order_acquire)) return false;
   stopMotors("serial X");
   return true;
 }
@@ -308,13 +309,13 @@ void setup() {
   }
 
   if (!initializeMotor(leftMotor, leftDriver, leftSensor, leftLinked, "LEFT")) {
-    if (stopRequested) return;
+    if (stopRequested.load(std::memory_order_acquire)) return;
     fault("motor alignment; check phases, magnets, supply and pole pairs");
     printEncoderDiagnostics();
     return;
   }
   if (!initializeMotor(rightMotor, rightDriver, rightSensor, rightLinked, "RIGHT")) {
-    if (stopRequested) return;
+    if (stopRequested.load(std::memory_order_acquire)) return;
     fault("motor alignment; check phases, magnets, supply and pole pairs");
     printEncoderDiagnostics();
     return;
@@ -336,7 +337,7 @@ void loop() {
 #if !defined(ARDUINO_ARCH_ESP32)
   pollStopRequest();
 #endif
-  if (stopRequested) stopMotors("serial X");
+  if (stopRequested.load(std::memory_order_acquire)) stopMotors("serial X");
   if (!running || faultLatched) {
     delay(2);
     return;
