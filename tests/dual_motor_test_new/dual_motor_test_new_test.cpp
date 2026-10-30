@@ -10,6 +10,18 @@
 static_assert(std::is_same<decltype(stopRequested), std::atomic<bool>>::value,
               "The cross-core stop latch must be atomic");
 
+constexpr const char* WEAK_WARNING = "WARNING: MAGNET_TOO_WEAK; continuing test";
+
+size_t countOccurrences(const std::string& text, const std::string& needle) {
+  size_t count = 0;
+  size_t position = 0;
+  while ((position = text.find(needle, position)) != std::string::npos) {
+    ++count;
+    position += needle.size();
+  }
+  return count;
+}
+
 void healthyEncoders() {
   Wire.registers[0x36][0x0B] = 0x20;
   Wire1.registers[0x36][0x0B] = 0x20;
@@ -43,6 +55,21 @@ int main(int argc, char** argv) {
     setup();
     assert(faultLatched && !running);
     assert(hostPins[LEFT_EN] == LOW && hostPins[RIGHT_EN] == LOW);
+  } else if (scenario == "weak-magnet") {
+    Wire1.registers[0x36][0x0B] = 0x13;
+    setup();
+    assert(running && !faultLatched);
+    assert(countOccurrences(Serial.output, WEAK_WARNING) == 1);
+  } else if (scenario == "strong-magnet") {
+    Wire1.registers[0x36][0x0B] = 0x28;
+    setup();
+    assert(faultLatched && !running);
+    assert(hostPins[LEFT_EN] == LOW && hostPins[RIGHT_EN] == LOW);
+  } else if (scenario == "invalid-magnet-status") {
+    Wire1.registers[0x36][0x0B] = 0x18;
+    setup();
+    assert(faultLatched && !running);
+    assert(hostPins[LEFT_EN] == LOW && hostPins[RIGHT_EN] == LOW);
   } else if (scenario == "serial-stop") {
     setup();
     Serial.input.push_back('X');
@@ -61,6 +88,27 @@ int main(int argc, char** argv) {
     loop();
     assert(faultLatched && !running);
     assert(hostPins[LEFT_EN] == LOW && hostPins[RIGHT_EN] == LOW);
+  } else if (scenario == "runtime-weak-magnet") {
+    setup();
+    Serial.output.clear();
+    Wire1.registers[0x36][0x0B] = 0x13;
+    hostTimeUs += 100000;
+    loop();
+    assert(running && !faultLatched);
+    assert(countOccurrences(Serial.output, WEAK_WARNING) == 1);
+    for (int i = 0; i < 3; ++i) {
+      hostTimeUs += 100000;
+      loop();
+    }
+    assert(countOccurrences(Serial.output, WEAK_WARNING) == 1);
+    Wire1.registers[0x36][0x0B] = 0x20;
+    hostTimeUs += 100000;
+    loop();
+    assert(countOccurrences(Serial.output, WEAK_WARNING) == 1);
+    Wire1.registers[0x36][0x0B] = 0x13;
+    hostTimeUs += 100000;
+    loop();
+    assert(countOccurrences(Serial.output, WEAK_WARNING) == 2);
   } else if (scenario == "overspeed") {
     setup();
     leftMotor.shaft_velocity = MAX_WHEEL_SPEED + 1.0f;

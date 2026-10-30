@@ -75,7 +75,15 @@ class CheckedAS5600 : public Sensor {
     }
     if (!readRegisters(bus_, 0x36, 0x0B, &magnetStatus, 1, diagnostic))
       return latchFailure(Failure::i2c);
-    if ((magnetStatus & 0x38) != 0x20) return latchFailure(Failure::magnet);
+    const uint8_t flags = magnetStatus & 0x38;
+    const bool nowWeak = (flags & 0x10) != 0 && (flags & 0x08) == 0;
+    weakWarningPending = nowWeak && !weakMagnet;
+    weakMagnet = nowWeak;
+    if (nowWeak) {
+      failure = Failure::none;
+      return true;
+    }
+    if (flags != 0x20) return latchFailure(Failure::magnet);
     failure = Failure::none;
     return true;
   }
@@ -94,6 +102,8 @@ class CheckedAS5600 : public Sensor {
   }
 
   bool failed = false;
+  bool weakMagnet = false;
+  bool weakWarningPending = false;
   Failure failure = Failure::none;
   I2cReadDiagnostic diagnostic;
   uint8_t magnetStatus = 0;
@@ -139,7 +149,9 @@ void printEncoderDiagnostic(const char* side, int sda, int scl,
 
   const uint8_t status = sensor.magnetStatus;
   const char* reason = "OK";
-  if (sensor.failure == CheckedAS5600::Failure::magnet) {
+  if (sensor.weakMagnet) {
+    reason = "WARNING: MAGNET_TOO_WEAK; continuing test";
+  } else if (sensor.failure == CheckedAS5600::Failure::magnet) {
     reason = (status & 0x18) == 0x18 ? "MAGNET_STATUS_INVALID" :
              (status & 0x10) ? "MAGNET_TOO_WEAK" :
              (status & 0x08) ? "MAGNET_TOO_STRONG" : "MAGNET_NOT_DETECTED";
@@ -222,7 +234,12 @@ bool checkEncoderMagnets(bool logHealthy = false) {
     printEncoderDiagnostics(true);
     return false;
   }
-  if (logHealthy) printEncoderDiagnostics(true);
+  if (logHealthy || leftSensor.weakWarningPending)
+    printEncoderDiagnostic("LEFT", LEFT_I2C_SDA, LEFT_I2C_SCL, leftSensor);
+  if (logHealthy || rightSensor.weakWarningPending)
+    printEncoderDiagnostic("RIGHT", RIGHT_I2C_SDA, RIGHT_I2C_SCL, rightSensor);
+  leftSensor.weakWarningPending = false;
+  rightSensor.weakWarningPending = false;
   return true;
 }
 

@@ -15,9 +15,13 @@ foreach ($scenario in @(
   'healthy',
   'encoder-failure',
   'magnet-failure',
+  'weak-magnet',
+  'strong-magnet',
+  'invalid-magnet-status',
   'serial-stop',
   'startup-stop',
   'runtime-encoder-failure',
+  'runtime-weak-magnet',
   'overspeed'
 )) {
   & $binary $scenario
