@@ -17,6 +17,7 @@ enum class FOCMotorStatus { motor_uncalibrated, motor_init_failed };
 enum class Direction { CW = 1, CCW = -1 };
 inline int hostInitFocCalls = 0;
 inline void (*hostInitFocHook)() = nullptr;
+struct SimpleFOCDebug { static void enable(HostSerial* = nullptr) {} };
 class BLDCDriver3PWM {
  public:
   BLDCDriver3PWM(int, int, int, int enable) : enablePin(enable) {}
@@ -39,6 +40,7 @@ class BLDCMotor {
   float target = 0, shaft_velocity = 0, zero_electric_angle = 0;
   float voltage_limit = 0, voltage_sensor_align = 0;
   bool enabled = false;
+  bool failInitFoc = false;
   void linkSensor(Sensor* s) { sensor_ = s; }
   void linkDriver(BLDCDriver3PWM* d) { driver_ = d; }
   void init() { motor_status = FOCMotorStatus::motor_uncalibrated; enable(); }
@@ -46,7 +48,7 @@ class BLDCMotor {
     ++hostInitFocCalls;
     if (hostInitFocHook) hostInitFocHook();
     sensor_->update();
-    return true;
+    return !failInitFoc;
   }
   void disable() {
     if (!driver_) throw std::runtime_error("uninitialized driver dereferenced");

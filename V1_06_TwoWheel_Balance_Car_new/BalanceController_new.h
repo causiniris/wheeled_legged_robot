@@ -16,14 +16,13 @@
 #include <Wire.h>
 #include <math.h>
 #include "BalanceMath_new.h"
-#include "SoftwareI2C_new.h"
+#include "MPU6050_archive_adapter.h"
 
 namespace {
 constexpr int LEFT_IN1 = 32, LEFT_IN2 = 33, LEFT_IN3 = 25, LEFT_EN = 12;
 constexpr int RIGHT_IN1 = 14, RIGHT_IN2 = 27, RIGHT_IN3 = 26, RIGHT_EN = 13;
 constexpr int LEFT_I2C_SDA = 21, LEFT_I2C_SCL = 22;
 constexpr int RIGHT_I2C_SDA = 19, RIGHT_I2C_SCL = 18;
-constexpr int MPU_I2C_SDA = 16, MPU_I2C_SCL = 17; // Dedicated software I2C.
 constexpr uint8_t MPU6050_ADDRESS = 0x68;  // AD0=GND; use 0x69 if AD0=3.3V.
 constexpr int POLE_PAIRS = 7;              // Inherited homework value; verify both motors.
 constexpr float SUPPLY_VOLTAGE = 12.0f;
@@ -92,31 +91,23 @@ bool readRegisters(TwoWire& bus, uint8_t address, uint8_t reg,
 
 // SimpleFOC 2.3.3's stock I2C sensor checks the register-address write but not
 // a short data read. This adapter rejects both and keeps errors latched.
-class CheckedAS5600 : public Sensor {
+class CheckedMT6701 : public Sensor {
  public:
-  enum class Failure { none, i2c, magnet };
-  explicit CheckedAS5600(TwoWire& bus) : bus_(bus) {}
+  enum class Failure { none, i2c };
+  explicit CheckedMT6701(TwoWire& bus) : bus_(bus) {}
   void init() override { Sensor::init(); }
   bool failed = false;
   Failure failure = Failure::none;
   I2cReadDiagnostic diagnostic;
-  uint8_t magnetStatus = 0;
-  bool magnetHealthy() {
-    if (failed) { cutEnablePins(); return false; }
-    if (!readRegisters(bus_, 0x36, 0x0B, &magnetStatus, 1, diagnostic))
-      return latchFailure(Failure::i2c);
-    if ((magnetStatus & 0x38) != 0x20) return latchFailure(Failure::magnet);
-    failure = Failure::none;
-    return true;
-  }
   float getSensorAngle() override {
     if (failed) { cutEnablePins(); return -1.0f; }
     uint8_t data[2];
-    if (!readRegisters(bus_, 0x36, 0x0C, data, 2, diagnostic)) {
+    if (!readRegisters(bus_, 0x06, 0x03, &data[0], 1, diagnostic) ||
+        !readRegisters(bus_, 0x06, 0x04, &data[1], 1, diagnostic)) {
       latchFailure(Failure::i2c);
       return -1.0f; // Sensor::update ignores this sample instead of inventing an angle.
     }
-    return (((data[0] & 0x0F) << 8) | data[1]) * (_2PI / 4096.0f);
+    return ((static_cast<uint16_t>(data[0]) << 6) | (data[1] >> 2)) * (_2PI / 16384.0f);
   }
  private:
   TwoWire& bus_;
@@ -128,11 +119,11 @@ class CheckedAS5600 : public Sensor {
   }
 };
 
-CheckedAS5600 leftSensor(Wire), rightSensor(Wire1);
+CheckedMT6701 leftSensor(Wire), rightSensor(Wire1);
 
-void printEncoderDiagnostic(const char* side, int sda, int scl, const CheckedAS5600& sensor) {
-  Serial.printf("AS5600 %s SDA%d/SCL%d addr=0x36: ", side, sda, scl);
-  if (sensor.failure == CheckedAS5600::Failure::i2c) {
+void printEncoderDiagnostic(const char* side, int sda, int scl, const CheckedMT6701& sensor) {
+  Serial.printf("MT6701 %s SDA%d/SCL%d addr=0x06: ", side, sda, scl);
+  if (sensor.failure == CheckedMT6701::Failure::i2c) {
     const I2cReadDiagnostic& d = sensor.diagnostic;
     if (d.writeCode != 0) {
       const char* reason = d.writeCode == 2 ? "address NACK" :
@@ -147,15 +138,7 @@ void printEncoderDiagnostic(const char* side, int sda, int scl, const CheckedAS5
     }
     return;
   }
-  const uint8_t status = sensor.magnetStatus;
-  const char* reason = "OK";
-  if (sensor.failure == CheckedAS5600::Failure::magnet) {
-    reason = (status & 0x18) == 0x18 ? "MAGNET_STATUS_INVALID" :
-             (status & 0x10) ? "MAGNET_TOO_WEAK" :
-             (status & 0x08) ? "MAGNET_TOO_STRONG" : "MAGNET_NOT_DETECTED";
-  }
-  Serial.printf("%s STATUS=0x%02X MD=%d ML=%d MH=%d\n", reason, unsigned(status),
-                (status & 0x20) != 0, (status & 0x10) != 0, (status & 0x08) != 0);
+  Serial.println("angle read OK (magnetic field not checked)");
 }
 void printEncoderDiagnostics(bool includeHealthy = false) {
   if (includeHealthy || leftSensor.failed)
@@ -164,7 +147,8 @@ void printEncoderDiagnostics(bool includeHealthy = false) {
     printEncoderDiagnostic("RIGHT", RIGHT_I2C_SDA, RIGHT_I2C_SCL, rightSensor);
 }
 
-SoftwareI2C_new mpuBus(MPU_I2C_SDA, MPU_I2C_SCL);
+uint32_t mpuDurationUs = 0;
+MpuArchiveAdapter mpu(Wire, MPU6050_ADDRESS);
 BLDCMotor leftMotor(POLE_PAIRS), rightMotor(POLE_PAIRS);
 BLDCDriver3PWM leftDriver(LEFT_IN1, LEFT_IN2, LEFT_IN3, LEFT_EN);
 BLDCDriver3PWM rightDriver(RIGHT_IN1, RIGHT_IN2, RIGHT_IN3, RIGHT_EN);
@@ -177,7 +161,7 @@ bool leftLinked = false, rightLinked = false, motorsReady = false;
 bool imuReady = false, faultLatched = false, armed = false, speedAssist = false;
 uint8_t testWheel = 0;
 uint32_t testStartMs = 0, lastControlUs = 0, lastImuUs = 0;
-uint32_t lastTelemetryMs = 0, lastMagnetCheckMs = 0;
+uint32_t lastTelemetryMs = 0;
 uint32_t lastFocUs = 0, maxFocGapUs = 0;
 
 bool driving() { return armed || testWheel != 0; }
@@ -204,31 +188,16 @@ void fault(const char* reason) {
   if (!faultLatched) Serial.printf("FAULT: %s. Check wiring/sensors, then reset.\n", reason);
   faultLatched = true;
 }
-bool checkEncoderMagnets(bool logHealthy = false) {
-  // Evaluate both sides, even if LEFT fails. A failed read immediately cuts EN.
-  const bool leftHealthy = leftSensor.magnetHealthy();
-  const bool rightHealthy = rightSensor.magnetHealthy();
-  if (!leftHealthy || !rightHealthy) {
-    fault("AS5600 check failed; see LEFT/RIGHT details below");
-    printEncoderDiagnostics(true);
-    return false;
-  }
-  if (logHealthy) printEncoderDiagnostics(true);
-  return true;
-}
-int16_t signed16(const uint8_t* data) {
-  return static_cast<int16_t>((static_cast<uint16_t>(data[0]) << 8) | data[1]);
-}
 float rawGyro(const ImuSample& s) { return IMU_PITCH_AXIS == 'X' ? s.gx : s.gy; }
 float accelPitch(const ImuSample& s) {
   const float horizontal = IMU_PITCH_AXIS == 'X' ? s.ay : -static_cast<float>(s.ax);
   return BalanceMath::wrapDeg(IMU_PITCH_SIGN * atan2f(horizontal, s.az) / BalanceMath::RAD_PER_DEG);
 }
 bool readImu(ImuSample& s) {
-  uint8_t data[14];
-  if (!mpuBus.readRegisters(MPU6050_ADDRESS, 0x3B, data, 14)) return false;
-  s.ax = signed16(data); s.ay = signed16(data + 2); s.az = signed16(data + 4);
-  s.gx = signed16(data + 8); s.gy = signed16(data + 10); s.gz = signed16(data + 12);
+  const uint32_t start = micros();
+  const bool readOk = mpu.getMotion6(s.ax, s.ay, s.az, s.gx, s.gy, s.gz);
+  mpuDurationUs = micros() - start;
+  if (!readOk) return false;
   const float norm2 = float(s.ax) * s.ax + float(s.ay) * s.ay + float(s.az) * s.az;
   const float plane2 = (IMU_PITCH_AXIS == 'X' ? float(s.ay) * s.ay : float(s.ax) * s.ax)
                        + float(s.az) * s.az;
@@ -237,20 +206,37 @@ bool readImu(ImuSample& s) {
          abs(int(s.ax)) < 32700 && abs(int(s.ay)) < 32700 && abs(int(s.az)) < 32700 &&
          abs(int(s.gx)) < 32700 && abs(int(s.gy)) < 32700 && abs(int(s.gz)) < 32700;
 }
-bool writeMpu(uint8_t reg, uint8_t value) {
-  return mpuBus.writeRegister(MPU6050_ADDRESS, reg, value);
-}
 bool initializeImu() {
   uint8_t identity = 0;
-  if (!mpuBus.readRegisters(MPU6050_ADDRESS, 0x75, &identity, 1) || identity != 0x68) return false;
-  if (!writeMpu(0x6B, 0x01) || // wake, X gyro PLL clock
-      !writeMpu(0x1A, 0x03) || // DLPF 44 Hz gyro
-      !writeMpu(0x19, 0x04) || // 1 kHz / (4 + 1) = 200 Hz
-      !writeMpu(0x1B, 0x00) || // +/-250 deg/s
-      !writeMpu(0x1C, 0x00)) return false; // +/-2 g
+  if (!mpu.readBytes(0x75, &identity, 1)) {
+    Serial.printf("MPU6050 WHO_AM_I read failed: addr=0x%02X reg=0x%02X wire_code=%u received=%u expected=%u\n",
+                  unsigned(MPU6050_ADDRESS), unsigned(mpu.diagnostic.reg),
+                  unsigned(mpu.diagnostic.writeCode), unsigned(mpu.diagnostic.received),
+                  unsigned(mpu.diagnostic.expected));
+    return false;
+  }
+  Serial.printf("MPU6050 WHO_AM_I=0x%02X\n", unsigned(identity));
+  if (identity == 0x00 || identity == 0xFF) {
+    Serial.println("MPU6050 invalid identity; check wiring and sensor");
+    return false;
+  }
+  if (identity != 0x68)
+    Serial.println("WARNING: unverified MPU6050-compatible identity; verify sensor output before use");
+  if (!mpu.initialize()) {
+    Serial.printf("MPU6050 config failed: reg=0x%02X wire_code=%u received=%u expected=%u\n",
+                  unsigned(mpu.diagnostic.reg), unsigned(mpu.diagnostic.writeCode),
+                  unsigned(mpu.diagnostic.received), unsigned(mpu.diagnostic.expected));
+    return false;
+  }
   delay(100);
   ImuSample s{};
-  return readImu(s);
+  if (!readImu(s)) {
+    Serial.printf("MPU6050 initial data read failed or out of range: wire_code=%u received=%u expected=%u\n",
+                  unsigned(mpu.diagnostic.writeCode), unsigned(mpu.diagnostic.received),
+                  unsigned(mpu.diagnostic.expected));
+    return false;
+  }
+  return true;
 }
 bool calibrateImu() {
   constexpr int SAMPLES = 300;
@@ -296,12 +282,16 @@ bool updatePitch(float dt) {
 }
 
 bool initializeMotor(BLDCMotor& motor, BLDCDriver3PWM& driver,
-                     CheckedAS5600& sensor, bool& linked, const char* label) {
+                     CheckedMT6701& sensor, bool& linked, const char* label) {
   motor.linkSensor(&sensor);
   driver.voltage_power_supply = SUPPLY_VOLTAGE;
   driver.voltage_limit = DRIVER_VOLTAGE_LIMIT;
   driver.pwm_frequency = PWM_FREQUENCY_HZ;
-  if (!driver.init()) return false;
+  if (!driver.init()) {
+    cutEnablePins();
+    Serial.printf("%s driver initialization FAILED\n", label);
+    return false;
+  }
   motor.linkDriver(&driver);
   linked = true; // Only now is motor.disable() safe to call.
   motor.torque_controller = TorqueControlType::voltage;
@@ -311,13 +301,35 @@ bool initializeMotor(BLDCMotor& motor, BLDCDriver3PWM& driver,
   motor.voltage_sensor_align = 2.0f;
   motor.LPF_velocity.Tf = 0.02f;
   motor.init();
-  if (motor.motor_status != FOCMotorStatus::motor_uncalibrated) return false;
+  if (motor.motor_status != FOCMotorStatus::motor_uncalibrated) {
+    motor.disable();
+    cutEnablePins();
+    Serial.printf("%s motor initialization FAILED\n", label);
+    return false;
+  }
   Serial.printf("%s FOC alignment: keep wheel free; it WILL move.\n", label);
+  Serial.printf("%s configuration: supply=%.2f V (configured, not measured), alignment=%.2f V, pole_pairs=%d\n",
+                label, SUPPLY_VOLTAGE, motor.voltage_sensor_align, POLE_PAIRS);
+  const float startAngle = sensor.getSensorAngle();
+  if (sensor.failed) {
+    motor.disable();
+    Serial.printf("%s FOC result: FAILED (encoder read before alignment)\n", label);
+    return false;
+  }
   const bool aligned = motor.initFOC();
   motor.disable();
   motor.target = 0;
   motor.voltage.q = motor.voltage.d = 0;
-  if (!aligned || sensor.failed) return false;
+  const float endAngle = sensor.failed ? -1.0f : sensor.getSensorAngle();
+  if (startAngle >= 0 && endAngle >= 0)
+    Serial.printf("%s encoder start=%.3f rad end=%.3f rad (endpoint readings only)\n",
+                  label, startAngle, endAngle);
+  if (!aligned || sensor.failed) {
+    Serial.printf("%s FOC result: FAILED (initFOC=%d encoder_fault=%d)\n",
+                  label, int(aligned), int(sensor.failed));
+    return false;
+  }
+  Serial.printf("%s FOC result: OK\n", label);
   Serial.printf("%s ready: sensor_direction=%d, electrical_zero=%.4f\n",
                 label, static_cast<int>(motor.sensor_direction), motor.zero_electric_angle);
   return true;
@@ -336,7 +348,10 @@ bool canStart() {
     Serial.println("Cannot start: hold upright, stop wheels, and wait for fresh IMU readings.");
     return false;
   }
-  if (!checkEncoderMagnets()) return false;
+  leftSensor.getSensorAngle(); rightSensor.getSensorAngle();
+  if (leftSensor.failed || rightSensor.failed) {
+    fault("MT6701 angle read"); printEncoderDiagnostics(); return false;
+  }
   speedIntegral = speedFiltered = speedLean = balanceVoltage = 0;
   lastFocUs = maxFocGapUs = 0;
   leftMotor.voltage.q = leftMotor.voltage.d = rightMotor.voltage.q = rightMotor.voltage.d = 0;
@@ -412,7 +427,7 @@ void printTelemetry() {
     pitchAngleDeg, balanceSetpointDeg, pitchRateDegPerSec,
     LEFT_MOTOR_SIGN * leftMotor.shaft_velocity, RIGHT_MOTOR_SIGN * rightMotor.shaft_velocity,
     balanceVoltage, speedLean, armed, testWheel, faultLatched,
-    static_cast<unsigned long>(mpuBus.durationUs()), static_cast<unsigned long>(maxFocGapUs));
+    static_cast<unsigned long>(mpuDurationUs), static_cast<unsigned long>(maxFocGapUs));
   // Drop telemetry if full; never wait for the UART while balancing.
   if (length > 0 && length < static_cast<int>(sizeof(line)) && Serial.availableForWrite() >= length) {
     Serial.write(reinterpret_cast<const uint8_t*>(line), length);
@@ -431,7 +446,7 @@ void setup() {
   delay(500);
   Serial.println("V1_06_TwoWheel_Balance_Car_new / ESP32 / SimpleFOC 2.3.3 / encoder diagnostics v2");
   Serial.println("Left PWM 32/33/25 EN12 I2C21/22; Right PWM14/27/26 EN13 I2C19/18");
-  Serial.println("MPU6050 ONLY: software I2C SDA16/SCL17, AD0=GND, pull-ups to 3.3V");
+  Serial.println("MPU6050 shares LEFT hardware I2C SDA21/SCL22, AD0=GND");
   Serial.println("Commands: L/R=short wheel test A=balance X=stop C=calibrate +/-=trim");
   Serial.println("Disarmed tuning: 1/0=Kp +/-0.5, 3/2=Kd +/-0.02, V=speed assist, ?=settings");
   if (!Wire.begin(LEFT_I2C_SDA, LEFT_I2C_SCL, 400000) ||
@@ -439,25 +454,36 @@ void setup() {
     fault("I2C initialization"); return;
   }
   Wire.setTimeOut(3); Wire1.setTimeOut(3);
-  if (!mpuBus.begin()) { fault(mpuBus.errorText()); return; }
-  if (!checkEncoderMagnets(true)) return;
   leftSensor.init(); rightSensor.init();
   if (leftSensor.failed || rightSensor.failed) {
-    fault("AS5600 angle initialization"); printEncoderDiagnostics(); return;
+    fault("MT6701 angle initialization"); printEncoderDiagnostics(true); return;
   }
+  printEncoderDiagnostics(true);
   if (!initializeImu()) {
-    if (mpuBus.error() != SoftwareI2C_new::Error::none) Serial.println(mpuBus.errorText());
-    fault("sensor initialization / MPU6050 identity"); return;
+    fault("MPU6050 initialization; see details above"); return;
   }
-  if (!initializeMotor(leftMotor, leftDriver, leftSensor, leftLinked, "LEFT") ||
-      !initializeMotor(rightMotor, rightDriver, rightSensor, rightLinked, "RIGHT")) {
+  SimpleFOCDebug::enable(&Serial);
+  const bool leftOk = initializeMotor(leftMotor, leftDriver, leftSensor, leftLinked, "LEFT");
+  bool rightOk = false;
+  bool rightAttempted = false;
+  if (!leftSensor.failed && !rightSensor.failed) {
+    if (!leftOk) Serial.println("LEFT failed; continuing RIGHT alignment. Both wheels must be free.");
+    rightAttempted = true;
+    rightOk = initializeMotor(rightMotor, rightDriver, rightSensor, rightLinked, "RIGHT");
+  } else {
+    Serial.println("RIGHT alignment skipped because of encoder communication fault.");
+  }
+  SimpleFOCDebug::enable(nullptr);
+  if (!leftOk || !rightOk) {
+    Serial.printf("Alignment summary: LEFT=%s RIGHT=%s\n", leftOk ? "OK" : "FAILED",
+                  rightOk ? "OK" : (rightAttempted ? "FAILED" : "SKIPPED"));
     fault("motor alignment; check phases, magnets, supply and pole pairs");
     printEncoderDiagnostics(); return;
   }
   motorsReady = true;
   stopMotors("startup");
   if (!calibrateImu()) { fault("IMU calibration failed / chassis moved"); return; }
-  lastTelemetryMs = lastMagnetCheckMs = millis();
+  lastTelemetryMs = millis();
   showSettings();
   lastControlUs = micros();
   Serial.println("Ready but disarmed. Verify pitch and L/R direction before A.");
@@ -480,9 +506,9 @@ void loop() {
     maxFocGapUs = (focUs - lastFocUs > maxFocGapUs) ? focUs - lastFocUs : maxFocGapUs;
   lastFocUs = focUs;
   leftMotor.loopFOC();
-  if (leftSensor.failed) { fault("LEFT AS5600 I2C read"); printEncoderDiagnostics(); return; }
+  if (leftSensor.failed) { fault("LEFT MT6701 I2C read"); printEncoderDiagnostics(); return; }
   rightMotor.loopFOC();
-  if (rightSensor.failed) { fault("RIGHT AS5600 I2C read"); printEncoderDiagnostics(); return; }
+  if (rightSensor.failed) { fault("RIGHT MT6701 I2C read"); printEncoderDiagnostics(); return; }
   // move() refreshes shaft_velocity even while disabled, using the latest sensor.
   leftMotor.move(LEFT_MOTOR_SIGN * (armed ? balanceVoltage : (testWheel == 1 ? TEST_VOLTAGE : 0)));
   rightMotor.move(RIGHT_MOTOR_SIGN * (armed ? balanceVoltage : (testWheel == 2 ? TEST_VOLTAGE : 0)));
@@ -498,16 +524,12 @@ void loop() {
     lastControlUs = nowUs;
     const float dt = elapsed * 1.0e-6f;
     if (!updatePitch(dt)) {
-      fault(mpuBus.error() == SoftwareI2C_new::Error::none ? "MPU6050 data range" : mpuBus.errorText());
+      fault("MPU6050 I2C read or data range");
       return;
     }
     if (driving() && fabsf(BalanceMath::wrapDeg(pitchAngleDeg-calibratedUprightDeg)) > MAX_TILT_DEG)
       stopMotors("tilt limit");
     if (armed) updateBalanceControl(dt);
-  }
-  if (millis() - lastMagnetCheckMs >= 100) {
-    lastMagnetCheckMs = millis();
-    if (!checkEncoderMagnets()) return;
   }
   processSerial();
   printTelemetry();

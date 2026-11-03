@@ -9,8 +9,8 @@
 | 闭环空载测速 | `V1_03_ClosedLoop_Velocity_Test_new/V1_03_ClosedLoop_Velocity_Test_new.ino` | `closedloop_velocity_test_new` |
 | 驱动占空比标定 | `V1_04_Driver_Calibration/V1_04_Driver_Calibration.ino` | `driver_calibration` |
 | 电压阶跃辨识 | `V1_05_Identification_Step/V1_05_Identification_Step.ino` | `identification_step` |
-| 双轮自平衡（MPU6050 + 双 AS5600） | `V1_06_TwoWheel_Balance_Car_new/V1_06_TwoWheel_Balance_Car_new.ino` | `balance_car_new` |
-| 双电机同时转动测试（双 AS5600，无 MPU6050） | `V1_07_DualMotor_Test_new/V1_07_DualMotor_Test_new.ino` | `dual_motor_test_new` |
+| 双轮自平衡（MPU6050 + 双 MT6701） | `V1_06_TwoWheel_Balance_Car_new/V1_06_TwoWheel_Balance_Car_new.ino` | `balance_car_new` |
+| 双电机同时转动测试（双 MT6701，无 MPU6050） | `V1_07_DualMotor_Test_new/V1_07_DualMotor_Test_new.ino` | `dual_motor_test_new` |
 
 ## 编译与烧录
 
@@ -96,9 +96,9 @@ target:6.28  actual:6.25  rpm:59.68
 
 新增环境为 `balance_car_new`，详细接线、方向检查、串口调参与保护说明见 [README_balance_new.md](README_balance_new.md)。
 
-- 左轮：PWM GPIO32/33/25、EN12、AS5600 SDA21/SCL22。
-- 右轮：PWM GPIO14/27/26、EN13、AS5600 SDA19/SCL18。
-- MPU6050 独立使用软件 I²C SDA16/SCL17，不与左右 AS5600 共用信号线；逐针接线见 [WIRING_I2C_new.md](WIRING_I2C_new.md)。四个 STS3215 先由外部方式固定姿态，本程序不控制舵机。
+- 左轮：PWM GPIO32/33/25、EN12、MT6701 SDA21/SCL22。
+- 右轮：PWM GPIO14/27/26、EN13、MT6701 SDA19/SCL18。
+- MPU6050 与左 MT6701 共用硬件 I²C SDA21/SCL22；逐针接线见 [WIRING_I2C_new.md](WIRING_I2C_new.md)。四个 STS3215 先由外部方式固定姿态，本程序不控制舵机。
 - 初始化 FOC 时两轮会转动；随后校准 MPU6050 并等待串口命令。`L/R` 为架空单轮限时测试，`A` 开始平衡，`X` 停机。
 - 这是可编译烧录的实车起调版，不能保证未经方向验证和调参就站稳，也不实现从地面自动起立。
 
@@ -112,12 +112,12 @@ pio device monitor -e balance_car_new -b 115200
 
 ## 5. 双电机同时转动测试
 
-`dual_motor_test_new` 是独立的双轮测试程序，不初始化或读取 MPU6050，也不修改 `balance_car_new`。接线与平衡程序的两路电机和两只 AS5600 相同。
+`dual_motor_test_new` 是独立的双轮测试程序，不初始化或读取 MPU6050。左 MT6701 接 SDA21/SCL22，右 MT6701 接 SDA19/SCL18；左驱动接 IN1/IN2/IN3/EN 为 32/33/25/12，右驱动为 14/27/26/13。编码器供电接 3.3 V，所有设备共地。
 
-首次运行必须支撑车体并架空两个车轮。程序先检查左右 AS5600 的 I²C 通信和磁铁状态，再依次执行左右电机 FOC 对齐；对齐过程本身会使车轮转动。两路均成功后，程序自动以 0.5 V q 轴电压让两个轮子按车辆前进方向持续转动。
+首次运行必须支撑车体并架空两个车轮。程序先读取左右 MT6701 的 I²C 角度，再依次执行左右电机 FOC 对齐；对齐过程本身会使车轮转动。两路均成功后，程序自动以 0.5 V q 轴电压让两个轮子按车辆前进方向持续转动。
 
 - FOC 对齐期间也会监听串口；发送 `X` 或 `x` 会关闭两路输出和 EN。本次上电不能重新启动，需复位 ESP32。
-- 本测试遇到 `MAGNET_TOO_WEAK` 会打印警告并继续；弱磁时角度反馈可能有噪声或不可靠。I²C 失败、完全无磁、磁场过强或状态无效仍会锁定停机。
+- MT6701 默认 I²C 地址为 `0x06`。本程序检查通信，不检查磁场强弱；必须确认磁铁位置和角度反馈可靠。I²C 失败会锁定停机。
 - 无效转速或超过 30 rad/s 时也会锁定停机。
 - 0.5 V 是电压指令，不是电流限制。运行前仍需核对 7 极对、12 V 电源、相线和实际转向。
 

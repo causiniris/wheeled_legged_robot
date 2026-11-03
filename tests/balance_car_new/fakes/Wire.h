@@ -5,14 +5,19 @@ class TwoWire {
   uint8_t registers[128][256]{};
   int nackAddress = -1, shortReadAddress = -1;
   int nackCode = 2;
-  bool begin(int, int, int) { return true; }
+  int sdaPin = -1, sclPin = -1;
+  bool lastStopByAddress[128]{};
+  bool begin(int sda, int scl, int) { sdaPin = sda; sclPin = scl; return true; }
   void setTimeOut(int) {}
   void beginTransmission(uint8_t address) { address_ = address; first_ = true; }
   void write(uint8_t value) {
     if (first_) { reg_ = value; first_ = false; }
     else registers[address_][reg_] = value;
   }
-  int endTransmission(bool = true) { return address_ == nackAddress ? nackCode : 0; }
+  int endTransmission(bool stop = true) {
+    lastStopByAddress[address_] = stop;
+    return address_ == nackAddress ? nackCode : 0;
+  }
   size_t requestFrom(uint8_t address, uint8_t length, uint8_t) {
     input_.clear();
     const int count = address == shortReadAddress ? length - 1 : length;

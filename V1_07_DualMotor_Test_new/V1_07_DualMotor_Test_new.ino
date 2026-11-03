@@ -23,7 +23,6 @@ constexpr float TEST_VOLTAGE = 0.5f;
 constexpr float LEFT_MOTOR_SIGN = 1.0f;
 constexpr float RIGHT_MOTOR_SIGN = -1.0f;
 constexpr float MAX_WHEEL_SPEED = 30.0f;
-constexpr uint32_t MAGNET_CHECK_PERIOD_MS = 100;
 constexpr uint32_t TELEMETRY_PERIOD_MS = 200;
 
 static_assert(LEFT_MOTOR_SIGN * LEFT_MOTOR_SIGN == 1.0f, "Left sign must be +/-1");
@@ -60,33 +59,13 @@ bool readRegisters(TwoWire& bus, uint8_t address, uint8_t reg,
   return true;
 }
 
-class CheckedAS5600 : public Sensor {
+class CheckedMT6701 : public Sensor {
  public:
-  enum class Failure { none, i2c, magnet };
+  enum class Failure { none, i2c };
 
-  explicit CheckedAS5600(TwoWire& bus) : bus_(bus) {}
+  explicit CheckedMT6701(TwoWire& bus) : bus_(bus) {}
 
   void init() override { Sensor::init(); }
-
-  bool magnetHealthy() {
-    if (failed) {
-      cutEnablePins();
-      return false;
-    }
-    if (!readRegisters(bus_, 0x36, 0x0B, &magnetStatus, 1, diagnostic))
-      return latchFailure(Failure::i2c);
-    const uint8_t flags = magnetStatus & 0x38;
-    const bool nowWeak = (flags & 0x10) != 0 && (flags & 0x08) == 0;
-    weakWarningPending = nowWeak && !weakMagnet;
-    weakMagnet = nowWeak;
-    if (nowWeak) {
-      failure = Failure::none;
-      return true;
-    }
-    if (flags != 0x20) return latchFailure(Failure::magnet);
-    failure = Failure::none;
-    return true;
-  }
 
   float getSensorAngle() override {
     if (failed) {
@@ -94,19 +73,17 @@ class CheckedAS5600 : public Sensor {
       return -1.0f;
     }
     uint8_t data[2];
-    if (!readRegisters(bus_, 0x36, 0x0C, data, 2, diagnostic)) {
+    if (!readRegisters(bus_, 0x06, 0x03, &data[0], 1, diagnostic) ||
+        !readRegisters(bus_, 0x06, 0x04, &data[1], 1, diagnostic)) {
       latchFailure(Failure::i2c);
       return -1.0f;
     }
-    return (((data[0] & 0x0F) << 8) | data[1]) * (_2PI / 4096.0f);
+    return ((static_cast<uint16_t>(data[0]) << 6) | (data[1] >> 2)) * (_2PI / 16384.0f);
   }
 
   bool failed = false;
-  bool weakMagnet = false;
-  bool weakWarningPending = false;
   Failure failure = Failure::none;
   I2cReadDiagnostic diagnostic;
-  uint8_t magnetStatus = 0;
 
  private:
   TwoWire& bus_;
@@ -119,19 +96,19 @@ class CheckedAS5600 : public Sensor {
   }
 };
 
-CheckedAS5600 leftSensor(Wire), rightSensor(Wire1);
+CheckedMT6701 leftSensor(Wire), rightSensor(Wire1);
 BLDCMotor leftMotor(POLE_PAIRS), rightMotor(POLE_PAIRS);
 BLDCDriver3PWM leftDriver(LEFT_IN1, LEFT_IN2, LEFT_IN3, LEFT_EN);
 BLDCDriver3PWM rightDriver(RIGHT_IN1, RIGHT_IN2, RIGHT_IN3, RIGHT_EN);
 bool leftLinked = false, rightLinked = false;
 bool running = false, faultLatched = false;
 std::atomic<bool> stopRequested{false};
-uint32_t lastMagnetCheckMs = 0, lastTelemetryMs = 0;
+uint32_t lastTelemetryMs = 0;
 
 void printEncoderDiagnostic(const char* side, int sda, int scl,
-                            const CheckedAS5600& sensor) {
-  Serial.printf("AS5600 %s SDA%d/SCL%d addr=0x36: ", side, sda, scl);
-  if (sensor.failure == CheckedAS5600::Failure::i2c) {
+                            const CheckedMT6701& sensor) {
+  Serial.printf("MT6701 %s SDA%d/SCL%d addr=0x06: ", side, sda, scl);
+  if (sensor.failure == CheckedMT6701::Failure::i2c) {
     const I2cReadDiagnostic& d = sensor.diagnostic;
     if (d.writeCode != 0) {
       const char* reason = d.writeCode == 2 ? "address NACK" :
@@ -147,17 +124,7 @@ void printEncoderDiagnostic(const char* side, int sda, int scl,
     return;
   }
 
-  const uint8_t status = sensor.magnetStatus;
-  const char* reason = "OK";
-  if (sensor.weakMagnet) {
-    reason = "WARNING: MAGNET_TOO_WEAK; continuing test";
-  } else if (sensor.failure == CheckedAS5600::Failure::magnet) {
-    reason = (status & 0x18) == 0x18 ? "MAGNET_STATUS_INVALID" :
-             (status & 0x10) ? "MAGNET_TOO_WEAK" :
-             (status & 0x08) ? "MAGNET_TOO_STRONG" : "MAGNET_NOT_DETECTED";
-  }
-  Serial.printf("%s STATUS=0x%02X MD=%d ML=%d MH=%d\n", reason, unsigned(status),
-                (status & 0x20) != 0, (status & 0x10) != 0, (status & 0x08) != 0);
+  Serial.println("angle read OK (magnetic field not checked)");
 }
 
 void printEncoderDiagnostics(bool includeHealthy = false) {
@@ -226,25 +193,8 @@ bool stopIfRequested() {
   return true;
 }
 
-bool checkEncoderMagnets(bool logHealthy = false) {
-  const bool leftHealthy = leftSensor.magnetHealthy();
-  const bool rightHealthy = rightSensor.magnetHealthy();
-  if (!leftHealthy || !rightHealthy) {
-    fault("AS5600 check failed; see LEFT/RIGHT details below");
-    printEncoderDiagnostics(true);
-    return false;
-  }
-  if (logHealthy || leftSensor.weakWarningPending)
-    printEncoderDiagnostic("LEFT", LEFT_I2C_SDA, LEFT_I2C_SCL, leftSensor);
-  if (logHealthy || rightSensor.weakWarningPending)
-    printEncoderDiagnostic("RIGHT", RIGHT_I2C_SDA, RIGHT_I2C_SCL, rightSensor);
-  leftSensor.weakWarningPending = false;
-  rightSensor.weakWarningPending = false;
-  return true;
-}
-
 bool initializeMotor(BLDCMotor& motor, BLDCDriver3PWM& driver,
-                     CheckedAS5600& sensor, bool& linked, const char* label) {
+                     CheckedMT6701& sensor, bool& linked, const char* label) {
   if (stopIfRequested()) return false;
   motor.linkSensor(&sensor);
   driver.voltage_power_supply = SUPPLY_VOLTAGE;
@@ -316,14 +266,14 @@ void setup() {
   Wire.setTimeOut(3);
   Wire1.setTimeOut(3);
 
-  if (!checkEncoderMagnets(true)) return;
   leftSensor.init();
   rightSensor.init();
   if (leftSensor.failed || rightSensor.failed) {
-    fault("AS5600 angle initialization");
-    printEncoderDiagnostics();
+    fault("MT6701 angle initialization");
+    printEncoderDiagnostics(true);
     return;
   }
+  printEncoderDiagnostics(true);
 
   if (!initializeMotor(leftMotor, leftDriver, leftSensor, leftLinked, "LEFT")) {
     if (stopRequested.load(std::memory_order_acquire)) return;
@@ -346,7 +296,7 @@ void setup() {
   running = true;
   leftMotor.move(LEFT_MOTOR_SIGN * TEST_VOLTAGE);
   rightMotor.move(RIGHT_MOTOR_SIGN * TEST_VOLTAGE);
-  lastMagnetCheckMs = lastTelemetryMs = millis();
+  lastTelemetryMs = millis();
   Serial.println("BOTH MOTORS RUNNING FORWARD AT 0.5 V; X stops until reset.");
 }
 
@@ -362,13 +312,13 @@ void loop() {
 
   leftMotor.loopFOC();
   if (leftSensor.failed) {
-    fault("LEFT AS5600 I2C read");
+    fault("LEFT MT6701 I2C read");
     printEncoderDiagnostics();
     return;
   }
   rightMotor.loopFOC();
   if (rightSensor.failed) {
-    fault("RIGHT AS5600 I2C read");
+    fault("RIGHT MT6701 I2C read");
     printEncoderDiagnostics();
     return;
   }
@@ -386,9 +336,5 @@ void loop() {
   leftMotor.move(LEFT_MOTOR_SIGN * TEST_VOLTAGE);
   rightMotor.move(RIGHT_MOTOR_SIGN * TEST_VOLTAGE);
 
-  if (millis() - lastMagnetCheckMs >= MAGNET_CHECK_PERIOD_MS) {
-    lastMagnetCheckMs = millis();
-    if (!checkEncoderMagnets()) return;
-  }
   printTelemetry();
 }
