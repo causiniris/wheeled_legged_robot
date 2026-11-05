@@ -449,11 +449,11 @@ void setup() {
   Serial.println("MPU6050 shares LEFT hardware I2C SDA21/SCL22, AD0=GND");
   Serial.println("Commands: L/R=short wheel test A=balance X=stop C=calibrate +/-=trim");
   Serial.println("Disarmed tuning: 1/0=Kp +/-0.5, 3/2=Kd +/-0.02, V=speed assist, ?=settings");
-  if (!Wire.begin(LEFT_I2C_SDA, LEFT_I2C_SCL, 400000) ||
-      !Wire1.begin(RIGHT_I2C_SDA, RIGHT_I2C_SCL, 400000)) {
+  if (!Wire.begin(LEFT_I2C_SDA, LEFT_I2C_SCL, 100000) ||
+      !Wire1.begin(RIGHT_I2C_SDA, RIGHT_I2C_SCL, 100000)) {
     fault("I2C initialization"); return;
   }
-  Wire.setTimeOut(3); Wire1.setTimeOut(3);
+  Wire.setTimeOut(10); Wire1.setTimeOut(10);
   leftSensor.init(); rightSensor.init();
   if (leftSensor.failed || rightSensor.failed) {
     fault("MT6701 angle initialization"); printEncoderDiagnostics(true); return;

@@ -3,6 +3,7 @@
 class TwoWire {
  public:
   uint8_t registers[128][256]{};
+  int transientShortReads = 0;
   int nackAddress = -1, shortReadAddress = -1;
   int nackCode = 2;
   int sdaPin = -1, sclPin = -1;
@@ -20,7 +21,9 @@ class TwoWire {
   }
   size_t requestFrom(uint8_t address, uint8_t length, uint8_t) {
     input_.clear();
-    const int count = address == shortReadAddress ? length - 1 : length;
+    const bool transient = transientShortReads > 0;
+    if (transient) --transientShortReads;
+    const int count = (transient || address == shortReadAddress) ? length - 1 : length;
     for (int i = 0; i < count; ++i) input_.push_back(registers[address][reg_ + i]);
     return input_.size();
   }

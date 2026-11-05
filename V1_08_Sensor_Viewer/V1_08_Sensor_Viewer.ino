@@ -88,11 +88,11 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println("# SENSOR VIEWER: motor EN12/EN13 LOW");
-  if (!Wire.begin(21, 22, 400000) || !Wire1.begin(19, 18, 400000)) {
+  if (!Wire.begin(21, 22, 100000) || !Wire1.begin(19, 18, 100000)) {
     Serial.println("# I2C initialization failed; reset after checking");
     return;
   }
-  Wire.setTimeOut(3); Wire1.setTimeOut(3);
+  Wire.setTimeOut(10); Wire1.setTimeOut(10);
   busesReady = true;
   scan(Wire, "LEFT GPIO21/22");
   scan(Wire1, "RIGHT GPIO19/18");

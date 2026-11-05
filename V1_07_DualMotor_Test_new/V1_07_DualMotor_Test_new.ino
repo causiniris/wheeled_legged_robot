@@ -14,6 +14,10 @@ constexpr int LEFT_IN1 = 32, LEFT_IN2 = 33, LEFT_IN3 = 25, LEFT_EN = 12;
 constexpr int RIGHT_IN1 = 14, RIGHT_IN2 = 27, RIGHT_IN3 = 26, RIGHT_EN = 13;
 constexpr int LEFT_I2C_SDA = 21, LEFT_I2C_SCL = 22;
 constexpr int RIGHT_I2C_SDA = 19, RIGHT_I2C_SCL = 18;
+// 两侧共享总线均使用标准100kHz，放宽慢响应模块的通信时间。
+constexpr uint32_t I2C_CLOCK_HZ = 100000;
+constexpr uint16_t I2C_TIMEOUT_MS = 10;
+constexpr int ENCODER_START_ATTEMPTS = 5;
 constexpr int POLE_PAIRS = 7;
 constexpr float SUPPLY_VOLTAGE = 12.0f;
 constexpr float DRIVER_VOLTAGE_LIMIT = 6.0f;
@@ -258,19 +262,30 @@ void setup() {
   Serial.println("Left PWM32/33/25 EN12 I2C21/22; Right PWM14/27/26 EN13 I2C19/18");
   Serial.println("After checks and FOC alignment both wheels run at 0.5 V; X stops until reset.");
 
-  if (!Wire.begin(LEFT_I2C_SDA, LEFT_I2C_SCL, 400000) ||
-      !Wire1.begin(RIGHT_I2C_SDA, RIGHT_I2C_SCL, 400000)) {
+  Serial.println("I2C startup fix: 100kHz, timeout 10ms, up to 5 startup attempts.");
+  if (!Wire.begin(LEFT_I2C_SDA, LEFT_I2C_SCL, I2C_CLOCK_HZ) ||
+      !Wire1.begin(RIGHT_I2C_SDA, RIGHT_I2C_SCL, I2C_CLOCK_HZ)) {
     fault("I2C initialization");
     return;
   }
-  Wire.setTimeOut(3);
-  Wire1.setTimeOut(3);
+  Wire.setTimeOut(I2C_TIMEOUT_MS);
+  Wire1.setTimeOut(I2C_TIMEOUT_MS);
+  delay(100); // 等待编码器供电稳定，此时两个EN均为低电平。
 
-  leftSensor.init();
-  rightSensor.init();
-  if (leftSensor.failed || rightSensor.failed) {
-    fault("MT6701 angle initialization");
+  // 仅在启动且驱动关闭时清除读取故障重试。运行中不重试驱动、不自动恢复。
+  for (int attempt = 1; attempt <= ENCODER_START_ATTEMPTS; ++attempt) {
+    if (stopIfRequested()) return;
+    leftSensor.failed = rightSensor.failed = false;
+    leftSensor.failure = rightSensor.failure = CheckedMT6701::Failure::none;
+    leftSensor.init();
+    rightSensor.init();
+    if (!leftSensor.failed && !rightSensor.failed) break;
+    Serial.printf("Encoder startup attempt %d/%d failed.\n", attempt, ENCODER_START_ATTEMPTS);
     printEncoderDiagnostics(true);
+    delay(50);
+  }
+  if (leftSensor.failed || rightSensor.failed) {
+    fault("MT6701 angle initialization after retries");
     return;
   }
   printEncoderDiagnostics(true);

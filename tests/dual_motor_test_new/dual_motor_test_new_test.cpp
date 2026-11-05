@@ -45,6 +45,16 @@ int main(int argc, char** argv) {
     Wire.registers[0x06][0x03] = 0x00;
     Wire.registers[0x06][0x04] = 0xFC;
     assert(std::fabs(leftSensor.getSensorAngle() - 63.0f * _2PI / 16384.0f) < 0.0001f);
+  } else if (scenario == "startup-short-read") {
+    Wire.transientShortReads = 1;
+    setup();
+    assert(running && !faultLatched && !leftSensor.failed);
+    assert(Serial.output.find("attempt 1/5 failed") != std::string::npos);
+  } else if (scenario == "persistent-short-read") {
+    Wire.shortReadAddress = 0x06;
+    setup();
+    assert(faultLatched && !running);
+    assert(hostPins[LEFT_EN] == LOW && hostPins[RIGHT_EN] == LOW);
   } else if (scenario == "encoder-failure") {
     Wire.nackAddress = 0x06;
     setup();
