@@ -47,7 +47,7 @@ static_assert(RIGHT_MOTOR_SIGN * RIGHT_MOTOR_SIGN == 1.0f, "Right sign must be +
 // Starting gains, not a measured tune for this chassis. Units: V/rad and V/(rad/s).
 // Upstream also uses a 2.9-ohm phase-resistance conversion; this firmware DOES NOT
 // assume that resistance, so the same numerical gains are not an equivalent tune.
-constexpr float INITIAL_ANGLE_KP = 8.8f, INITIAL_ANGLE_KD = 0.29f;
+constexpr float INITIAL_ANGLE_KP = 8.8f, INITIAL_ANGLE_KI = 0.0f, INITIAL_ANGLE_KD = 0.29f;
 constexpr float SPEED_KP = 0.20f; // deg / (wheel rad/s)
 constexpr float SPEED_KI = 0.05f; // deg / wheel rad, optional slow speed loop
 constexpr float MAX_SPEED_LEAN_DEG = 3.0f;
@@ -56,7 +56,7 @@ constexpr float MAX_WHEEL_SPEED = 30.0f; // rad/s; independent of SimpleFOC velo
 constexpr float TEST_VOLTAGE = 0.5f;
 constexpr uint32_t TEST_DURATION_MS = 200;
 constexpr uint32_t BALANCE_PERIOD_US = 5000, MAX_CONTROL_GAP_US = 30000;
-constexpr uint32_t TELEMETRY_PERIOD_MS = 200;
+constexpr uint32_t TELEMETRY_PERIOD_MS = 50;
 constexpr float FILTER_TIME_CONSTANT = 0.245f; // alpha=0.98 at 5 ms; handles variable dt.
 constexpr float GYRO_SCALE = 131.0f; // +/-250 deg/s
 
@@ -155,7 +155,8 @@ BLDCDriver3PWM rightDriver(RIGHT_IN1, RIGHT_IN2, RIGHT_IN3, RIGHT_EN);
 struct ImuSample { int16_t ax, ay, az, gx, gy, gz; };
 float gyroBias = 0, pitchAngleDeg = 0, pitchRateDegPerSec = 0;
 float balanceSetpointDeg = 0, calibratedUprightDeg = 0, balanceVoltage = 0;
-float angleKp = INITIAL_ANGLE_KP, angleKd = INITIAL_ANGLE_KD;
+float angleKp = INITIAL_ANGLE_KP, angleKi = INITIAL_ANGLE_KI, angleKd = INITIAL_ANGLE_KD;
+float angleIntegral = 0;
 float speedFiltered = 0, speedIntegral = 0, speedLean = 0;
 bool leftLinked = false, rightLinked = false, motorsReady = false;
 bool imuReady = false, faultLatched = false, armed = false, speedAssist = false;
@@ -180,7 +181,7 @@ void stopMotors(const char* reason) {
   }
   armed = false;
   testWheel = 0;
-  balanceVoltage = speedIntegral = speedLean = 0;
+  balanceVoltage = speedIntegral = speedLean = angleIntegral = 0;
   if (wasDriving) Serial.printf("STOP: %s\n", reason);
 }
 void fault(const char* reason) {
@@ -239,16 +240,25 @@ bool initializeImu() {
   return true;
 }
 bool calibrateImu() {
+  imuReady = false;
   constexpr int SAMPLES = 300;
   double gyroSum = 0, gyroSquares = 0, sinSum = 0, cosSum = 0;
   float minAngle = 0, maxAngle = 0, firstAngle = 0;
   Serial.println("CALIBRATE: hold upright and STILL for about 2 seconds; motors are disabled.");
   for (int i = 0; i < SAMPLES; ++i) {
     ImuSample s{};
-    if (!readImu(s)) return false;
+    if (!readImu(s)) {
+      Serial.printf("CALIBRATION FAILED sample=%d: I2C or invalid data reg=0x%02X wire_code=%u received=%u\n",
+                    i, unsigned(mpu.diagnostic.reg), unsigned(mpu.diagnostic.writeCode),
+                    unsigned(mpu.diagnostic.received));
+      return false;
+    }
     const float g = rawGyro(s), angle = accelPitch(s);
     const float norm = sqrtf(float(s.ax)*s.ax + float(s.ay)*s.ay + float(s.az)*s.az) / 16384.0f;
-    if (norm < 0.85f || norm > 1.15f) return false;
+    if (norm < 0.70f || norm > 1.40f) {
+      Serial.printf("CALIBRATION FAILED sample=%d: acceleration=%.3f g (allowed 0.70-1.40)\n", i, norm);
+      return false;
+    }
     if (i == 0) firstAngle = angle;
     const float relative = BalanceMath::wrapDeg(angle - firstAngle);
     minAngle = fminf(minAngle, relative); maxAngle = fmaxf(maxAngle, relative);
@@ -259,8 +269,15 @@ bool calibrateImu() {
   }
   const double mean = gyroSum / SAMPLES;
   const double variance = fmax(0.0, gyroSquares / SAMPLES - mean * mean);
-  if (sqrt(variance) / GYRO_SCALE > 0.8 || fabs(mean) / GYRO_SCALE > 10.0 ||
-      maxAngle - minAngle > 2.0f) return false;
+  const float gyroStd = sqrt(variance) / GYRO_SCALE;
+  const float gyroMean = mean / GYRO_SCALE;
+  const float angleSpan = maxAngle - minAngle;
+  Serial.printf("CALIBRATION stats: gyro_mean=%.3f dps std=%.3f dps angle_span=%.3f deg\n",
+                gyroMean, gyroStd, angleSpan);
+  if (gyroStd > 1.5f || fabsf(gyroMean) > 10.0f || angleSpan > 30.0f) {
+    Serial.println("CALIBRATION FAILED: limits std<=1.5 dps mean<=10 dps angle_span<=30 deg");
+    return false;
+  }
   gyroBias = mean;
   pitchAngleDeg = atan2f(sinSum, cosSum) / BalanceMath::RAD_PER_DEG;
   calibratedUprightDeg = balanceSetpointDeg = pitchAngleDeg;
@@ -341,26 +358,30 @@ bool canStart() {
     Serial.println("Cannot start: initialization/sensor fault; check and reset.");
     return false;
   }
+  // Calibration can block for seconds. Refresh wheel feedback before arming.
+  leftMotor.loopFOC(); rightMotor.loopFOC();
+  if (leftSensor.failed || rightSensor.failed) {
+    fault("MT6701 angle read"); printEncoderDiagnostics(); return false;
+  }
+  leftMotor.move(0); rightMotor.move(0);
   if (micros() - lastImuUs > 15000 || !isfinite(pitchAngleDeg) ||
       fabsf(BalanceMath::wrapDeg(pitchAngleDeg - balanceSetpointDeg)) > ARM_TILT_DEG ||
-      fabsf(pitchRateDegPerSec) > 20.0f || fabsf(leftMotor.shaft_velocity) > 1.0f ||
+      !isfinite(pitchRateDegPerSec) || !isfinite(leftMotor.shaft_velocity) ||
+      !isfinite(rightMotor.shaft_velocity) || fabsf(pitchRateDegPerSec) > 20.0f ||
+      fabsf(leftMotor.shaft_velocity) > 1.0f ||
       fabsf(rightMotor.shaft_velocity) > 1.0f) {
     Serial.println("Cannot start: hold upright, stop wheels, and wait for fresh IMU readings.");
     return false;
   }
-  leftSensor.getSensorAngle(); rightSensor.getSensorAngle();
-  if (leftSensor.failed || rightSensor.failed) {
-    fault("MT6701 angle read"); printEncoderDiagnostics(); return false;
-  }
-  speedIntegral = speedFiltered = speedLean = balanceVoltage = 0;
+  speedIntegral = speedFiltered = speedLean = balanceVoltage = angleIntegral = 0;
   lastFocUs = maxFocGapUs = 0;
   leftMotor.voltage.q = leftMotor.voltage.d = rightMotor.voltage.q = rightMotor.voltage.d = 0;
   leftMotor.target = rightMotor.target = 0;
   return true;
 }
 void showSettings() {
-  Serial.printf("Kp=%.2f Kd=%.2f speedAssist=%d set=%.2f axis=%c signs=%.0f/%.0f/%.0f\n",
-    angleKp, angleKd, speedAssist, balanceSetpointDeg, IMU_PITCH_AXIS,
+  Serial.printf("Kp=%.2f Ki=%.2f Kd=%.2f speedAssist=%d set=%.2f axis=%c signs=%.0f/%.0f/%.0f\n",
+    angleKp, angleKi, angleKd, speedAssist, balanceSetpointDeg, IMU_PITCH_AXIS,
     IMU_PITCH_SIGN, LEFT_MOTOR_SIGN, RIGHT_MOTOR_SIGN);
 }
 void processSerial() {
@@ -371,6 +392,13 @@ void processSerial() {
     if (c == '\n' || c == '\r' || c == ' ') continue;
     if (driving()) continue; // Only X is acted on while a test/balance is running.
     if (c == 'A' || c == 'a') {
+      if (!imuReady && motorsReady && !faultLatched) {
+        Serial.println("A: retrying IMU calibration; keep chassis still.");
+        if (!calibrateImu()) {
+          Serial.println("Cannot start: IMU calibration failed; motors remain disabled. Send A to retry.");
+          return;
+        }
+      }
       if (canStart()) {
         Serial.println("BALANCE ARMED; X stops.");
         leftMotor.enable(); rightMotor.enable(); armed = true;
@@ -389,7 +417,8 @@ void processSerial() {
     if (c == 'C' || c == 'c') {
       if (!faultLatched && motorsReady) {
         stopMotors("recalibration");
-        if (!calibrateImu()) fault("IMU calibration failed / chassis moved");
+        if (!calibrateImu()) Serial.println("IMU calibration failed; motors remain disabled. Send C or A to retry.");
+        else Serial.println("IMU calibrated. Ready but disarmed.");
       }
       return;
     }
@@ -401,6 +430,8 @@ void processSerial() {
     else if (c == '0') angleKp = fmaxf(0.0f, angleKp - 0.5f);
     else if (c == '3') angleKd = fminf(5.0f, angleKd + 0.02f);
     else if (c == '2') angleKd = fmaxf(0.0f, angleKd - 0.02f);
+    else if (c == '5') angleKi = fminf(10.0f, angleKi + 0.1f);
+    else if (c == '4') angleKi = fmaxf(0.0f, angleKi - 0.1f);
     else if (c == 'V' || c == 'v') speedAssist = !speedAssist;
     else if (c != '?') continue;
     showSettings();
@@ -413,20 +444,22 @@ void updateBalanceControl(float dt) {
   speedFiltered += dt / (0.10f + dt) * (wheelSpeed - speedFiltered);
   speedLean = speedAssist ? BalanceMath::speedLeanDeg(speedFiltered, dt, SPEED_KP, SPEED_KI,
                                                      MAX_SPEED_LEAN_DEG, speedIntegral) : 0;
-  balanceVoltage = BalanceMath::voltage(pitchAngleDeg, balanceSetpointDeg + speedLean,
-                                        pitchRateDegPerSec, angleKp, angleKd, MOTOR_VOLTAGE_LIMIT);
+  balanceVoltage = BalanceMath::voltagePid(pitchAngleDeg, balanceSetpointDeg + speedLean,
+                                           pitchRateDegPerSec, angleKp, angleKi, angleKd,
+                                           dt, MOTOR_VOLTAGE_LIMIT, angleIntegral);
   if (!isfinite(balanceVoltage)) fault("non-finite controller output");
 }
 void printTelemetry() {
   const uint32_t now = millis();
   if (now - lastTelemetryMs < TELEMETRY_PERIOD_MS) return;
   lastTelemetryMs = now;
-  char line[192];
+  char line[256];
   const int length = snprintf(line, sizeof(line),
-    "pitch=%.2f set=%.2f rate=%.2f wl=%.2f wr=%.2f u=%.2f lean=%.2f A=%d T=%u F=%d imu_us=%lu foc_us=%lu\n",
+    "ms=%lu pitch=%.2f set=%.2f rate=%.2f wl=%.2f wr=%.2f u=%.2f lean=%.2f A=%d T=%u F=%d kp=%.2f ki=%.2f kd=%.2f imu_us=%lu foc_us=%lu\n",
+    static_cast<unsigned long>(now),
     pitchAngleDeg, balanceSetpointDeg, pitchRateDegPerSec,
     LEFT_MOTOR_SIGN * leftMotor.shaft_velocity, RIGHT_MOTOR_SIGN * rightMotor.shaft_velocity,
-    balanceVoltage, speedLean, armed, testWheel, faultLatched,
+    balanceVoltage, speedLean, armed, testWheel, faultLatched, angleKp, angleKi, angleKd,
     static_cast<unsigned long>(mpuDurationUs), static_cast<unsigned long>(maxFocGapUs));
   // Drop telemetry if full; never wait for the UART while balancing.
   if (length > 0 && length < static_cast<int>(sizeof(line)) && Serial.availableForWrite() >= length) {
@@ -448,7 +481,7 @@ void setup() {
   Serial.println("Left PWM 32/33/25 EN12 I2C21/22; Right PWM14/27/26 EN13 I2C19/18");
   Serial.println("MPU6050 shares LEFT hardware I2C SDA21/SCL22, AD0=GND");
   Serial.println("Commands: L/R=short wheel test A=balance X=stop C=calibrate +/-=trim");
-  Serial.println("Disarmed tuning: 1/0=Kp +/-0.5, 3/2=Kd +/-0.02, V=speed assist, ?=settings");
+  Serial.println("Disarmed tuning: 1/0=Kp +/-0.5, 5/4=Ki +/-0.1, 3/2=Kd +/-0.02, V=speed assist, ?=settings");
   if (!Wire.begin(LEFT_I2C_SDA, LEFT_I2C_SCL, 400000) ||
       !Wire1.begin(RIGHT_I2C_SDA, RIGHT_I2C_SCL, 400000)) {
     fault("I2C initialization"); return;
@@ -482,7 +515,10 @@ void setup() {
   }
   motorsReady = true;
   stopMotors("startup");
-  if (!calibrateImu()) { fault("IMU calibration failed / chassis moved"); return; }
+  if (!calibrateImu()) {
+    Serial.println("IMU calibration failed; motors remain disabled. Send C or A to retry.");
+    return;
+  }
   lastTelemetryMs = millis();
   showSettings();
   lastControlUs = micros();

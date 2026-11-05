@@ -7,6 +7,7 @@ class TwoWire {
   int nackCode = 2;
   int sdaPin = -1, sclPin = -1;
   bool lastStopByAddress[128]{};
+  void (*requestHook)(uint8_t, uint8_t) = nullptr;
   bool begin(int sda, int scl, int) { sdaPin = sda; sclPin = scl; return true; }
   void setTimeOut(int) {}
   void beginTransmission(uint8_t address) { address_ = address; first_ = true; }
@@ -20,6 +21,7 @@ class TwoWire {
   }
   size_t requestFrom(uint8_t address, uint8_t length, uint8_t) {
     input_.clear();
+    if (requestHook) requestHook(address, static_cast<uint8_t>(reg_));
     const int count = address == shortReadAddress ? length - 1 : length;
     for (int i = 0; i < count; ++i) input_.push_back(registers[address][reg_ + i]);
     return input_.size();

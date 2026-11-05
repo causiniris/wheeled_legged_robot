@@ -23,6 +23,18 @@ inline float voltage(float pitch, float target, float rate, float kp, float kd,
   return clamp((kp * wrapDeg(pitch - target) + kd * rate) * RAD_PER_DEG,
                -limit, limit);
 }
+inline float voltagePid(float pitch, float target, float rate, float kp, float ki,
+                        float kd, float dt, float limit, float& integral) {
+  const float error = wrapDeg(pitch - target) * RAD_PER_DEG;
+  const float base = kp * error + kd * rate * RAD_PER_DEG;
+  if (ki <= 0) integral = 0;
+  else {
+    const float candidate = clamp(integral + error * dt, -1.0f, 1.0f);
+    const float requested = base + ki * candidate;
+    if (fabsf(requested) <= limit || requested * error < 0) integral = candidate;
+  }
+  return clamp(base + ki * integral, -limit, limit);
+}
 // Positive pitch and wheel speed both mean chassis-forward. A forward-moving
 // chassis must lean backward to slow down; do not subtract wheel speed directly
 // from motor voltage, which can oppose the fast balance loop's recovery.

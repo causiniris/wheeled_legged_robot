@@ -2,9 +2,14 @@
 #include <cassert>
 #include <cmath>
 #include <iostream>
+#include <limits>
 #include "../../V1_06_TwoWheel_Balance_Car_new/BalanceController_new.h"
 
 void command(char c) { Serial.input.push_back(c); processSerial(); }
+void setAccelZ(int16_t raw) {
+  Wire.registers[0x68][0x3F] = static_cast<uint16_t>(raw) >> 8;
+  Wire.registers[0x68][0x40] = static_cast<uint8_t>(raw);
+}
 void failLeftSensorDuringAlignment() { Wire.shortReadAddress = 0x06; }
 void prepareHealthyDevices() {
   Serial.output.clear(); Serial.input.clear();
@@ -28,6 +33,45 @@ void healthySetup() {
   assert(!hostPins[LEFT_EN] && !hostPins[RIGHT_EN]);
 }
 int main() {
+  prepareHealthyDevices();
+  setAccelZ(11796); // 0.72 g: accepted in the expanded range
+  assert(calibrateImu());
+  setAccelZ(22610); // 1.38 g: accepted in the expanded range
+  assert(calibrateImu());
+  setAccelZ(11305); // 0.69 g: still rejected
+  assert(!calibrateImu());
+  setAccelZ(23101); // 1.41 g: still rejected
+  assert(!calibrateImu());
+  setAccelZ(16384);
+  Wire.registers[0x68][0x43] = 0x05; // 1441 / 131 = 11 deg/s: bias still rejected
+  Wire.registers[0x68][0x44] = 0xA1;
+  assert(!calibrateImu());
+  Wire.registers[0x68][0x43] = Wire.registers[0x68][0x44] = 0;
+
+  prepareHealthyDevices();
+  setAccelZ(24576); // 1.5 g: startup calibration fails but remains disarmed
+  setup();
+  assert(motorsReady && !imuReady && !faultLatched && !driving());
+  assert(Serial.output.find("CALIBRATION FAILED sample=") != std::string::npos);
+  setAccelZ(16384);
+  command('A'); // retries calibration and arms only after success
+  assert(armed && imuReady && !faultLatched);
+  command('X');
+  assert(!driving() && !hostPins[LEFT_EN] && !hostPins[RIGHT_EN]);
+
+  prepareHealthyDevices();
+  setAccelZ(24576);
+  setup();
+  assert(motorsReady && !imuReady && !faultLatched && !driving());
+  setAccelZ(16384);
+  command('C'); // permit checking telemetry and direction before arming
+  assert(imuReady && !faultLatched && !driving());
+  assert(Serial.output.find("IMU calibrated. Ready but disarmed.") != std::string::npos);
+  leftMotor.shaft_velocity = std::numeric_limits<float>::quiet_NaN();
+  command('A');
+  assert(!armed && !hostPins[LEFT_EN] && !hostPins[RIGHT_EN]);
+  leftMotor.shaft_velocity = 0;
+
   prepareHealthyDevices();
   leftMotor.failInitFoc = true;
   setup();
@@ -99,12 +143,27 @@ int main() {
   command('A'); assert(!armed);
 
   healthySetup();
+  command('5');
+  assert(fabsf(angleKi - 0.1f) < 0.001f);
+  command('4');
+  assert(fabsf(angleKi) < 0.001f);
+  hostTimeUs += 50000;
+  printTelemetry();
+  assert(Serial.output.find("ms=") != std::string::npos);
+  assert(Serial.output.find("kp=") != std::string::npos);
+  assert(Serial.output.find("ki=") != std::string::npos);
+  assert(Serial.output.find("kd=") != std::string::npos);
+  assert(updatePitch(0.005f)); lastControlUs = micros();
   hostTimeUs += 20000;
   command('A'); assert(!armed);
   assert(updatePitch(0.005f)); lastControlUs = micros();
   command('A'); assert(armed && hostPins[LEFT_EN] && hostPins[RIGHT_EN]);
+  const float armedKp = angleKp;
+  command('1'); assert(angleKp == armedKp); // gains only change while disarmed
   command('C'); assert(armed);
+  angleIntegral = 0.5f;
   command('X'); assert(!driving() && !hostPins[LEFT_EN] && !hostPins[RIGHT_EN]);
+  assert(angleIntegral == 0);
   assert(leftMotor.voltage.q == 0 && rightMotor.voltage.q == 0);
 
   healthySetup(); command('L'); assert(testWheel == 1 && hostPins[LEFT_EN] && !hostPins[RIGHT_EN]);
@@ -141,6 +200,12 @@ int main() {
   assert(voltage(-5, 0, 0, 8.8f, 0.29f, 3) < 0);
   assert(fabsf(voltage(0, 0, 10, 8.8f, 0.29f, 3) - 0.0506145f) < 0.0001f);
   assert(voltage(45, 0, 100, 8.8f, 0.29f, 3) == 3);
+  float angleIntegral = 0;
+  assert(voltagePid(5, 0, 0, 0, 1, 0, 0.1f, 3, angleIntegral) > 0);
+  assert(angleIntegral > 0);
+  angleIntegral = 0;
+  assert(voltagePid(45, 0, 0, 60, 1, 0, 0.1f, 3, angleIntegral) == 3);
+  assert(angleIntegral == 0); // No integral windup into saturation.
   float integral = 0;
   assert(speedLeanDeg(5, 0.005f, 0.2f, 0.05f, 3, integral) < 0);
   integral = 0;
