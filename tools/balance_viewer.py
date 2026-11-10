@@ -6,6 +6,11 @@ import math
 import sys
 import time
 
+try:
+    from auto_pid import AutoPid
+except ModuleNotFoundError:
+    from tools.auto_pid import AutoPid
+
 FIELDS = ("ms", "pitch", "set", "rate", "wl", "wr", "u", "lean", "A", "T", "F", "kp", "ki", "kd")
 
 
@@ -25,6 +30,10 @@ def parse_sample(line):
         return None
     if sample["ms"] < 0 or sample["A"] not in (0, 1) or sample["F"] not in (0, 1) or sample["T"] not in (0, 1, 2):
         return None
+    if "guard" in fields:
+        if fields["guard"] not in ("0", "1"):
+            return None
+        sample["guard"] = int(fields["guard"])
     return sample
 
 
@@ -68,7 +77,7 @@ def main():
             log.close()
         print(f"Cannot open {port}: {exc}. Close PlatformIO Monitor first.", file=sys.stderr)
         return 1
-    writer = csv.DictWriter(log, fieldnames=FIELDS) if log else None
+    writer = csv.DictWriter(log, fieldnames=(*FIELDS, "guard")) if log else None
     if writer:
         writer.writeheader()
     fig, axes = plt.subplots(4, 1, sharex=True, figsize=(11, 9))
@@ -87,17 +96,41 @@ def main():
     status = fig.text(0.02, 0.19, "Waiting for balance telemetry; startup messages are in terminal.")
     notice = fig.text(0.02, 0.155, "Gains apply only while stopped. FOC alignment moves wheels at reset.", fontsize=9)
     buttons = []
+    latest_sample = None
+
+    def write_command(command):
+        if connection.write(command.encode("ascii")) != 1:
+            raise OSError("serial command not fully written")
+
+    tuner = AutoPid(write_command)
 
     def send(command):
+        if command == "AUTO":
+            if tuner.active:
+                tuner.cancel("operator stop")
+            elif last_sample_wall is None or time.monotonic() - last_sample_wall > 0.5:
+                notice.set_text("Auto PID needs fresh telemetry.")
+                return
+            else:
+                tuner.begin(latest_sample, time.monotonic())
+            notice.set_text(tuner.message)
+            return
+        if tuner.active:
+            if command in ("X", "x"):
+                tuner.cancel("operator stop")
+                notice.set_text(tuner.message)
+            else:
+                notice.set_text("Auto PID running: use STOP X to cancel.")
+            return
         try:
-            connection.write(command.encode("ascii"))
+            write_command(command)
             notice.set_text(f"Sent {command}; check serial output for acceptance.")
         except (serial.SerialException, OSError) as exc:
             notice.set_text(f"Serial send failed: {exc}; cut motor power if necessary.")
 
     commands = (("START A", "A"), ("STOP X", "X"), ("CAL C", "C"), ("LEFT L", "L"), ("RIGHT R", "R"),
                 ("Kp +", "1"), ("Kp -", "0"), ("Ki +", "5"),
-                ("Ki -", "4"), ("Kd +", "3"), ("Kd -", "2"))
+                ("Ki -", "4"), ("Kd +", "3"), ("Kd -", "2"), ("AUTO PID", "AUTO"))
     for i, (title, key) in enumerate(commands):
         rect = (0.02 + (i % 6) * 0.16, 0.085 if i < 6 else 0.02, 0.14, 0.05)
         button = Button(fig.add_axes(rect), title, color="lightcoral" if key == "X" else "0.85")
@@ -110,11 +143,16 @@ def main():
     origin = last_time = last_sample_wall = None
 
     def update(_):
-        nonlocal origin, last_time, last_sample_wall
+        nonlocal origin, last_time, last_sample_wall, latest_sample
+        tuner.tick(time.monotonic())
+        if tuner.state in ("finished", "stopped"):
+            notice.set_text(tuner.message)
         try:
             pending.extend(connection.read(min(connection.in_waiting, 8192)))
         except (serial.SerialException, OSError) as exc:
+            tuner.cancel("serial disconnected; cut motor power")
             status.set_text(f"Serial disconnected: {exc}; cut motor power if necessary.")
+            notice.set_text(tuner.message)
             return []
         while b"\n" in pending:
             raw, _, rest = pending.partition(b"\n")
@@ -125,6 +163,7 @@ def main():
                 if line:
                     print(line, flush=True)
                     if "FAULT" in line or "FAILED" in line or "Cannot start" in line:
+                        tuner.cancel(line)
                         status.set_text(line)
                 continue
             now = sample["ms"] / 1000.0
@@ -135,6 +174,8 @@ def main():
                     column.clear()
             last_time = now
             last_sample_wall = time.monotonic()
+            latest_sample = sample
+            tuner.on_sample(sample, last_sample_wall)
             times.append(now - origin)
             for key in data:
                 value = ((sample["set"] + sample["lean"] + 180) % 360 - 180) if key == "target" else sample[key]
@@ -144,6 +185,8 @@ def main():
                 log.flush()
             status.set_text(f"{port} | A={int(sample['A'])} F={int(sample['F'])} | "
                             f"Kp={sample['kp']:.2f} Ki={sample['ki']:.2f} Kd={sample['kd']:.2f}")
+            if tuner.active or tuner.state in ("finished", "stopped"):
+                notice.set_text(tuner.message)
         if len(pending) > 16384:
             pending.clear()
         if last_sample_wall is not None and time.monotonic() - last_sample_wall > 1:
@@ -163,6 +206,7 @@ def main():
     try:
         plt.show()
     finally:
+        tuner.cancel("window closed")
         try:
             connection.write(b"X")
         except (serial.SerialException, OSError):

@@ -57,6 +57,7 @@ constexpr float TEST_VOLTAGE = 0.5f;
 constexpr uint32_t TEST_DURATION_MS = 200;
 constexpr uint32_t BALANCE_PERIOD_US = 5000, MAX_CONTROL_GAP_US = 30000;
 constexpr uint32_t TELEMETRY_PERIOD_MS = 50;
+constexpr uint32_t AUTOTUNE_HEARTBEAT_TIMEOUT_MS = 500;
 constexpr float FILTER_TIME_CONSTANT = 0.245f; // alpha=0.98 at 5 ms; handles variable dt.
 constexpr float GYRO_SCALE = 131.0f; // +/-250 deg/s
 
@@ -160,6 +161,8 @@ float angleIntegral = 0;
 float speedFiltered = 0, speedIntegral = 0, speedLean = 0;
 bool leftLinked = false, rightLinked = false, motorsReady = false;
 bool imuReady = false, faultLatched = false, armed = false, speedAssist = false;
+bool autotuneGuard = false;
+uint32_t lastAutotuneHeartbeatMs = 0;
 uint8_t testWheel = 0;
 uint32_t testStartMs = 0, lastControlUs = 0, lastImuUs = 0;
 uint32_t lastTelemetryMs = 0;
@@ -354,6 +357,10 @@ bool initializeMotor(BLDCMotor& motor, BLDCDriver3PWM& driver,
 
 bool canStart() {
   if (driving()) return false;
+  if (autotuneGuard && millis() - lastAutotuneHeartbeatMs > AUTOTUNE_HEARTBEAT_TIMEOUT_MS) {
+    Serial.println("Cannot start: autotune heartbeat expired.");
+    return false;
+  }
   if (faultLatched || !motorsReady || !imuReady || leftSensor.failed || rightSensor.failed) {
     Serial.println("Cannot start: initialization/sensor fault; check and reset.");
     return false;
@@ -389,8 +396,21 @@ void processSerial() {
   for (int n = 0; n < 16 && Serial.available() > 0; ++n) {
     const char c = Serial.read();
     if (c == 'X' || c == 'x') { stopMotors("serial X"); return; }
+    if (c == 'H') {
+      if (!faultLatched && (autotuneGuard || (!driving() && motorsReady && imuReady))) {
+        if (!autotuneGuard) Serial.println("AUTOTUNE GUARD ON");
+        autotuneGuard = true;
+        lastAutotuneHeartbeatMs = millis();
+      }
+      continue;
+    }
     if (c == '\n' || c == '\r' || c == ' ') continue;
-    if (driving()) continue; // Only X is acted on while a test/balance is running.
+    if (driving()) continue; // Only X and the heartbeat are accepted while driving.
+    if (c == 'Q' && autotuneGuard) {
+      autotuneGuard = false;
+      Serial.println("AUTOTUNE GUARD OFF");
+      return;
+    }
     if (c == 'A' || c == 'a') {
       if (!imuReady && motorsReady && !faultLatched) {
         Serial.println("A: retrying IMU calibration; keep chassis still.");
@@ -455,12 +475,12 @@ void printTelemetry() {
   lastTelemetryMs = now;
   char line[256];
   const int length = snprintf(line, sizeof(line),
-    "ms=%lu pitch=%.2f set=%.2f rate=%.2f wl=%.2f wr=%.2f u=%.2f lean=%.2f A=%d T=%u F=%d kp=%.2f ki=%.2f kd=%.2f imu_us=%lu foc_us=%lu\n",
+    "ms=%lu pitch=%.2f set=%.2f rate=%.2f wl=%.2f wr=%.2f u=%.2f lean=%.2f A=%d T=%u F=%d kp=%.2f ki=%.2f kd=%.2f imu_us=%lu foc_us=%lu guard=%d\n",
     static_cast<unsigned long>(now),
     pitchAngleDeg, balanceSetpointDeg, pitchRateDegPerSec,
     LEFT_MOTOR_SIGN * leftMotor.shaft_velocity, RIGHT_MOTOR_SIGN * rightMotor.shaft_velocity,
     balanceVoltage, speedLean, armed, testWheel, faultLatched, angleKp, angleKi, angleKd,
-    static_cast<unsigned long>(mpuDurationUs), static_cast<unsigned long>(maxFocGapUs));
+    static_cast<unsigned long>(mpuDurationUs), static_cast<unsigned long>(maxFocGapUs), autotuneGuard);
   // Drop telemetry if full; never wait for the UART while balancing.
   if (length > 0 && length < static_cast<int>(sizeof(line)) && Serial.availableForWrite() >= length) {
     Serial.write(reinterpret_cast<const uint8_t*>(line), length);
@@ -530,6 +550,9 @@ void loop() {
     processSerial();
     delay(2);
     return;
+  }
+  if (driving() && autotuneGuard && millis() - lastAutotuneHeartbeatMs > AUTOTUNE_HEARTBEAT_TIMEOUT_MS) {
+    fault("autotune heartbeat timeout"); return;
   }
   if (driving() && micros() - lastControlUs > MAX_CONTROL_GAP_US) {
     fault("control loop overdue"); return;
