@@ -6,7 +6,7 @@ void command(char c) { Serial.input.push_back(c); processSerial(); }
 
 int main() {
   Wire.registers[0x68][0x75] = 0x68;
-  Wire.registers[0x68][0x3F] = 0x40;
+  Wire.registers[0x68][0x3D] = 0x20;
   setup();
   assert(motorsReady && imuReady && !driving());
 

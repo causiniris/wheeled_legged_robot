@@ -84,7 +84,7 @@ def main():
     fig.canvas.manager.set_window_title(f"Balance Viewer - {port}")
     fig.subplots_adjust(left=0.09, right=0.98, top=0.97, bottom=0.24, hspace=0.15)
     groups = (("pitch", "set", "target"), ("rate",), ("u",), ("wl", "wr"))
-    labels = ("Pitch / set (deg)", "Pitch rate (deg/s)", "Command (V)", "Wheel (rad/s)")
+    labels = ("Pitch / set (deg)", "Pitch rate (deg/s)", "Balance command (V)", "Wheel (rad/s)")
     plots = {}
     for axis, keys, label in zip(axes, groups, labels):
         for key in keys:
@@ -97,6 +97,7 @@ def main():
     notice = fig.text(0.02, 0.155, "Gains apply only while stopped. FOC alignment moves wheels at reset.", fontsize=9)
     buttons = []
     latest_sample = None
+    fault_status = None
 
     def write_command(command):
         if connection.write(command.encode("ascii")) != 1:
@@ -143,9 +144,9 @@ def main():
     origin = last_time = last_sample_wall = None
 
     def update(_):
-        nonlocal origin, last_time, last_sample_wall, latest_sample
-        tuner.tick(time.monotonic())
-        if tuner.state in ("finished", "stopped"):
+        nonlocal origin, last_time, last_sample_wall, latest_sample, fault_status
+        if tuner.active:
+            tuner.tick(time.monotonic())
             notice.set_text(tuner.message)
         try:
             pending.extend(connection.read(min(connection.in_waiting, 8192)))
@@ -162,9 +163,18 @@ def main():
             if sample is None:
                 if line:
                     print(line, flush=True)
-                    if "FAULT" in line or "FAILED" in line or "Cannot start" in line:
-                        tuner.cancel(line)
-                        status.set_text(line)
+                    encoder_fault = line.startswith("MT6701 ") and ": I2C_" in line
+                    if line.startswith(("FAULT:", "CALIBRATION FAILED")) or encoder_fault:
+                        fault_status = line
+                    if encoder_fault or "FAULT" in line or "FAILED" in line or "Cannot start" in line:
+                        if tuner.active:
+                            tuner.cancel(fault_status or line)
+                            notice.set_text(tuner.message)
+                        status.set_text(fault_status or line)
+                    if not tuner.active and line.startswith(("Wheel test:", "BALANCE ARMED", "Cannot start:",
+                                                            "STOP:", "OVERSPEED:", "Ready but disarmed",
+                                                            "IMU calibrated.", "IMU WAIT:", "IMU RECOVERED:")):
+                        notice.set_text(line)
                 continue
             now = sample["ms"] / 1000.0
             if origin is None or (last_time is not None and now < last_time):
@@ -175,7 +185,9 @@ def main():
             last_time = now
             last_sample_wall = time.monotonic()
             latest_sample = sample
-            tuner.on_sample(sample, last_sample_wall)
+            if tuner.active:
+                tuner.on_sample(sample, last_sample_wall)
+                notice.set_text(tuner.message)
             times.append(now - origin)
             for key in data:
                 value = ((sample["set"] + sample["lean"] + 180) % 360 - 180) if key == "target" else sample[key]
@@ -183,13 +195,13 @@ def main():
             if writer:
                 writer.writerow(sample)
                 log.flush()
-            status.set_text(f"{port} | A={int(sample['A'])} F={int(sample['F'])} | "
+            if not sample["F"]:
+                fault_status = None
+            status.set_text(fault_status or f"{port} | A={int(sample['A'])} T={int(sample['T'])} F={int(sample['F'])} | "
                             f"Kp={sample['kp']:.2f} Ki={sample['ki']:.2f} Kd={sample['kd']:.2f}")
-            if tuner.active or tuner.state in ("finished", "stopped"):
-                notice.set_text(tuner.message)
         if len(pending) > 16384:
             pending.clear()
-        if last_sample_wall is not None and time.monotonic() - last_sample_wall > 1:
+        if fault_status is None and last_sample_wall is not None and time.monotonic() - last_sample_wall > 1:
             status.set_text("Telemetry stale (>1 s): do not rely on display; check serial and cut power if needed.")
         if times:
             for key, line in plots.items():

@@ -30,10 +30,14 @@
 struct MpuArchiveDiagnostic {
   uint8_t reg = 0, expected = 0, writeCode = 0;
   size_t received = 0;
+  int available = 0;
 };
 
 class MpuArchiveAdapter {
  public:
+  static constexpr uint8_t ACCEL_RANGE_SELECT = 1; // ACCEL_CONFIG AFS_SEL for +/-4 g.
+  static constexpr float ACCEL_COUNTS_PER_G = 16384.0f / (1U << ACCEL_RANGE_SELECT);
+
   MpuArchiveAdapter(TwoWire& bus, uint8_t address) : bus_(bus), address_(address) {}
   MpuArchiveDiagnostic diagnostic;
 
@@ -46,7 +50,8 @@ class MpuArchiveAdapter {
     diagnostic.writeCode = bus_.endTransmission(); // STOP, as in archive I2Cdev.cpp.
     if (diagnostic.writeCode != 0) return false;
     diagnostic.received = bus_.requestFrom(address_, length, static_cast<uint8_t>(true));
-    if (diagnostic.received != length || bus_.available() < length) {
+    diagnostic.available = bus_.available();
+    if (diagnostic.received != length || diagnostic.available < length) {
       while (bus_.available()) bus_.read();
       return false;
     }
@@ -76,7 +81,7 @@ class MpuArchiveAdapter {
     // Same sequence as MPU6050::initialize() from the supplied archive.
     return writeBits(0x6B, 2, 3, 1) && // X gyro PLL clock
            writeBits(0x1B, 4, 2, 0) && // +/-250 deg/s
-           writeBits(0x1C, 4, 2, 0) && // +/-2 g
+           writeBits(0x1C, 4, 2, ACCEL_RANGE_SELECT) &&
            writeBits(0x6B, 6, 1, 0) && // wake
            writeBits(0x1A, 2, 3, 3) && // preserve existing 44 Hz filter
            writeByte(0x19, 4);          // preserve existing 200 Hz sampling

@@ -97,7 +97,7 @@ target:6.28  actual:6.25  rpm:59.68
 新增环境为 `balance_car_new`，详细接线、方向检查、串口调参与保护说明见 [README_balance_new.md](README_balance_new.md)。
 
 - 左轮：PWM GPIO32/33/25、EN12、MT6701 SDA21/SCL22。
-- 右轮：PWM GPIO14/27/26、EN13、MT6701 SDA19/SCL18。
+- 右轮：PWM GPIO14/27/26、EN13、MT6701 SDA17/SCL16。
 - MPU6050 与左 MT6701 共用硬件 I²C SDA21/SCL22；逐针接线见 [WIRING_I2C_new.md](WIRING_I2C_new.md)。四个 STS3215 先由外部方式固定姿态，本程序不控制舵机。
 - 初始化 FOC 时两轮会转动；随后校准 MPU6050 并等待串口命令。`L/R` 为架空单轮限时测试，`A` 开始平衡，`X` 停机。
 - 这是可编译烧录的实车起调版，不能保证未经方向验证和调参就站稳，也不实现从地面自动起立。
@@ -112,7 +112,7 @@ pio device monitor -e balance_car_new -b 115200
 
 ## 5. 双电机同时转动测试
 
-`dual_motor_test_new` 是独立的双轮测试程序，不初始化或读取 MPU6050。左 MT6701 接 SDA21/SCL22，右 MT6701 接 SDA19/SCL18；左驱动接 IN1/IN2/IN3/EN 为 32/33/25/12，右驱动为 14/27/26/13。编码器供电接 3.3 V，所有设备共地。
+`dual_motor_test_new` 是独立的双轮测试程序，不初始化或读取 MPU6050。左 MT6701 接 SDA21/SCL22，右 MT6701 接 SDA17/SCL16；左驱动接 IN1/IN2/IN3/EN 为 32/33/25/12，右驱动为 14/27/26/13。编码器供电接 3.3 V，所有设备共地。
 
 首次运行必须支撑车体并架空两个车轮。程序先读取左右 MT6701 的 I²C 角度，再依次执行左右电机 FOC 对齐；对齐过程本身会使车轮转动。两路均成功后，程序自动以 0.5 V q 轴电压让两个轮子按车辆前进方向持续转动。
 

@@ -13,7 +13,7 @@ namespace {
 constexpr int LEFT_IN1 = 32, LEFT_IN2 = 33, LEFT_IN3 = 25, LEFT_EN = 12;
 constexpr int RIGHT_IN1 = 14, RIGHT_IN2 = 27, RIGHT_IN3 = 26, RIGHT_EN = 13;
 constexpr int LEFT_I2C_SDA = 21, LEFT_I2C_SCL = 22;
-constexpr int RIGHT_I2C_SDA = 19, RIGHT_I2C_SCL = 18;
+constexpr int RIGHT_I2C_SDA = 17, RIGHT_I2C_SCL = 16;
 constexpr int POLE_PAIRS = 7;
 constexpr float SUPPLY_VOLTAGE = 12.0f;
 constexpr float DRIVER_VOLTAGE_LIMIT = 6.0f;
@@ -255,7 +255,8 @@ void setup() {
   if (stopIfRequested()) return;
   Serial.println("V1_07_DualMotor_Test_new / ESP32 / SimpleFOC 2.3.3");
   Serial.println("Support chassis; both wheels must be off the floor.");
-  Serial.println("Left PWM32/33/25 EN12 I2C21/22; Right PWM14/27/26 EN13 I2C19/18");
+  Serial.printf("Left PWM32/33/25 EN12 I2C21/22; Right PWM14/27/26 EN13 I2C%d/%d\n",
+                RIGHT_I2C_SDA, RIGHT_I2C_SCL);
   Serial.println("After checks and FOC alignment both wheels run at 0.5 V; X stops until reset.");
 
   if (!Wire.begin(LEFT_I2C_SDA, LEFT_I2C_SCL, 400000) ||

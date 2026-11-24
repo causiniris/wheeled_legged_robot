@@ -22,7 +22,8 @@ namespace {
 constexpr int LEFT_IN1 = 32, LEFT_IN2 = 33, LEFT_IN3 = 25, LEFT_EN = 12;
 constexpr int RIGHT_IN1 = 14, RIGHT_IN2 = 27, RIGHT_IN3 = 26, RIGHT_EN = 13;
 constexpr int LEFT_I2C_SDA = 21, LEFT_I2C_SCL = 22;
-constexpr int RIGHT_I2C_SDA = 19, RIGHT_I2C_SCL = 18;
+constexpr int RIGHT_I2C_SDA = 17, RIGHT_I2C_SCL = 16;
+constexpr uint32_t LEFT_I2C_HZ = 100000, RIGHT_I2C_HZ = 100000;
 constexpr uint8_t MPU6050_ADDRESS = 0x68;  // AD0=GND; use 0x69 if AD0=3.3V.
 constexpr int POLE_PAIRS = 7;              // Inherited homework value; verify both motors.
 constexpr float SUPPLY_VOLTAGE = 12.0f;
@@ -30,35 +31,39 @@ constexpr float DRIVER_VOLTAGE_LIMIT = 6.0f;
 constexpr float MOTOR_VOLTAGE_LIMIT = 3.0f; // q-axis voltage, NOT a current limit.
 constexpr long PWM_FREQUENCY_HZ = 10000;
 
-// Configure the IMU rotation axis parallel to the wheel axle. Default: X axle,
-// Z points approximately up. If the axle is parallel to sensor Y, choose 'Y'.
+// Select the IMU axis parallel to the wheel axle. Startup calibration accounts
+// for a fixed mounting angle around that axis.
 // The sign must make a physical forward lean read positive pitch AND rate.
-constexpr char IMU_PITCH_AXIS = 'X';
+constexpr char IMU_PITCH_AXIS = 'Z';
 constexpr float IMU_PITCH_SIGN = 1.0f;
 // Each positive signed wheel command must propel the chassis forward.
 // These are installation assumptions, verified separately by L/R commands.
 constexpr float LEFT_MOTOR_SIGN = 1.0f;
 constexpr float RIGHT_MOTOR_SIGN = -1.0f;
-static_assert(IMU_PITCH_AXIS == 'X' || IMU_PITCH_AXIS == 'Y', "Use X or Y IMU axis");
+static_assert(IMU_PITCH_AXIS == 'X' || IMU_PITCH_AXIS == 'Y' || IMU_PITCH_AXIS == 'Z',
+              "Use X, Y or Z IMU axis");
 static_assert(IMU_PITCH_SIGN == 1.0f || IMU_PITCH_SIGN == -1.0f, "IMU sign must be +/-1");
 static_assert(LEFT_MOTOR_SIGN * LEFT_MOTOR_SIGN == 1.0f, "Left sign must be +/-1");
 static_assert(RIGHT_MOTOR_SIGN * RIGHT_MOTOR_SIGN == 1.0f, "Right sign must be +/-1");
 
-// Starting gains, not a measured tune for this chassis. Units: V/rad and V/(rad/s).
-// Upstream also uses a 2.9-ohm phase-resistance conversion; this firmware DOES NOT
-// assume that resistance, so the same numerical gains are not an equivalent tune.
-constexpr float INITIAL_ANGLE_KP = 8.8f, INITIAL_ANGLE_KI = 0.0f, INITIAL_ANGLE_KD = 0.29f;
-constexpr float SPEED_KP = 0.20f; // deg / (wheel rad/s)
-constexpr float SPEED_KI = 0.05f; // deg / wheel rad, optional slow speed loop
-constexpr float MAX_SPEED_LEAN_DEG = 3.0f;
+// Fixed-leg model starting gains. See analysis/revised_motor_pid/check_balance_defaults.py.
+// Angle gains use radians. The wheel-speed PI gives a lean correction in degrees.
+constexpr float INITIAL_ANGLE_KP = 56.0f, INITIAL_ANGLE_KI = 0.0f, INITIAL_ANGLE_KD = 1.90f;
+constexpr float SPEED_KP = 0.31f; // deg / (wheel rad/s)
+constexpr float SPEED_KI = 0.20f; // deg / wheel rad
+constexpr float MAX_SPEED_LEAN_DEG = 1.0f;
 constexpr float MAX_TILT_DEG = 35.0f, ARM_TILT_DEG = 8.0f;
-constexpr float MAX_WHEEL_SPEED = 30.0f; // rad/s; independent of SimpleFOC velocity_limit.
 constexpr float TEST_VOLTAGE = 0.5f;
 constexpr uint32_t TEST_DURATION_MS = 200;
 constexpr uint32_t BALANCE_PERIOD_US = 5000, MAX_CONTROL_GAP_US = 30000;
+constexpr uint32_t MAX_GYRO_ONLY_US = 30000;
+constexpr uint32_t IMU_SETTLE_US = 100000;
+constexpr char IMU_PITCH_PLANE_LOW[] = "MPU6050 DATA_RANGE: pitch-plane acceleration too low";
+constexpr char IMU_ACCEL_SATURATION[] = "MPU6050 DATA_RANGE: accelerometer saturation";
+constexpr char IMU_GYRO_SATURATION[] = "MPU6050 DATA_RANGE: gyroscope saturation";
 constexpr uint32_t TELEMETRY_PERIOD_MS = 50;
 constexpr uint32_t AUTOTUNE_HEARTBEAT_TIMEOUT_MS = 500;
-constexpr float FILTER_TIME_CONSTANT = 0.245f; // alpha=0.98 at 5 ms; handles variable dt.
+constexpr float FILTER_TIME_CONSTANT = 1.75f; // Slow gravity correction during wheel acceleration.
 constexpr float GYRO_SCALE = 131.0f; // +/-250 deg/s
 
 void cutEnablePins() {
@@ -155,16 +160,19 @@ BLDCDriver3PWM leftDriver(LEFT_IN1, LEFT_IN2, LEFT_IN3, LEFT_EN);
 BLDCDriver3PWM rightDriver(RIGHT_IN1, RIGHT_IN2, RIGHT_IN3, RIGHT_EN);
 struct ImuSample { int16_t ax, ay, az, gx, gy, gz; };
 float gyroBias = 0, pitchAngleDeg = 0, pitchRateDegPerSec = 0;
-float balanceSetpointDeg = 0, calibratedUprightDeg = 0, balanceVoltage = 0;
+float balanceSetpointDeg = 0, imuPitchZeroDeg = 0, balanceVoltage = 0;
 float angleKp = INITIAL_ANGLE_KP, angleKi = INITIAL_ANGLE_KI, angleKd = INITIAL_ANGLE_KD;
 float angleIntegral = 0;
 float speedFiltered = 0, speedIntegral = 0, speedLean = 0;
 bool leftLinked = false, rightLinked = false, motorsReady = false;
-bool imuReady = false, faultLatched = false, armed = false, speedAssist = false;
+bool imuReady = false, faultLatched = false, armed = false, speedAssist = true;
+bool imuSettling = false;
+uint32_t lastImuSaturationUs = 0;
+const char* faultReason = nullptr;
 bool autotuneGuard = false;
 uint32_t lastAutotuneHeartbeatMs = 0;
 uint8_t testWheel = 0;
-uint32_t testStartMs = 0, lastControlUs = 0, lastImuUs = 0;
+uint32_t testStartMs = 0, lastControlUs = 0, lastValidPitchAccelUs = 0;
 uint32_t lastTelemetryMs = 0;
 uint32_t lastFocUs = 0, maxFocGapUs = 0;
 
@@ -189,31 +197,66 @@ void stopMotors(const char* reason) {
 }
 void fault(const char* reason) {
   stopMotors(reason);
-  if (!faultLatched) Serial.printf("FAULT: %s. Check wiring/sensors, then reset.\n", reason);
-  faultLatched = true;
+  if (!faultLatched) {
+    faultLatched = true;
+    faultReason = reason;
+    Serial.printf("FAULT: %s. Check wiring/sensors, then reset.\n", reason);
+  }
 }
-float rawGyro(const ImuSample& s) { return IMU_PITCH_AXIS == 'X' ? s.gx : s.gy; }
+float rawGyro(const ImuSample& s) {
+  if (IMU_PITCH_AXIS == 'X') return s.gx;
+  if (IMU_PITCH_AXIS == 'Y') return s.gy;
+  return s.gz;
+}
+struct PitchAccel {
+  float numerator, denominator;
+};
+PitchAccel projectPitchAccel(const ImuSample& s) {
+  // Order the components so atan2 follows the positive gyro rotation.
+  if (IMU_PITCH_AXIS == 'X') return {float(s.ay), float(s.az)};
+  if (IMU_PITCH_AXIS == 'Y') return {-float(s.ax), float(s.az)};
+  return {float(s.ax), float(s.ay)};
+}
 float accelPitch(const ImuSample& s) {
-  const float horizontal = IMU_PITCH_AXIS == 'X' ? s.ay : -static_cast<float>(s.ax);
-  return BalanceMath::wrapDeg(IMU_PITCH_SIGN * atan2f(horizontal, s.az) / BalanceMath::RAD_PER_DEG);
+  const PitchAccel pitch = projectPitchAccel(s);
+  return BalanceMath::wrapDeg(IMU_PITCH_SIGN * atan2f(pitch.numerator, pitch.denominator) /
+                              BalanceMath::RAD_PER_DEG);
 }
-bool readImu(ImuSample& s) {
+const char* readImu(ImuSample& s) {
   const uint32_t start = micros();
   const bool readOk = mpu.getMotion6(s.ax, s.ay, s.az, s.gx, s.gy, s.gz);
   mpuDurationUs = micros() - start;
-  if (!readOk) return false;
+  if (!readOk) {
+    return mpu.diagnostic.writeCode != 0 ? "MPU6050 I2C_ERROR: register write failed"
+                                         : "MPU6050 I2C_ERROR: short read";
+  }
   const float norm2 = float(s.ax) * s.ax + float(s.ay) * s.ay + float(s.az) * s.az;
-  const float plane2 = (IMU_PITCH_AXIS == 'X' ? float(s.ay) * s.ay : float(s.ax) * s.ax)
-                       + float(s.az) * s.az;
-  // Reject zero/free-fall data, saturated sensors and an almost-vertical axle.
-  return norm2 > 2684354.0f && plane2 > 2684354.0f &&
-         abs(int(s.ax)) < 32700 && abs(int(s.ay)) < 32700 && abs(int(s.az)) < 32700 &&
-         abs(int(s.gx)) < 32700 && abs(int(s.gy)) < 32700 && abs(int(s.gz)) < 32700;
+  const PitchAccel pitch = projectPitchAccel(s);
+  const float plane2 = pitch.numerator * pitch.numerator + pitch.denominator * pitch.denominator;
+  constexpr float minAccelCounts = 0.1f * MpuArchiveAdapter::ACCEL_COUNTS_PER_G;
+  constexpr float minAccelSquared = minAccelCounts * minAccelCounts;
+  if (norm2 <= minAccelSquared) return "MPU6050 DATA_RANGE: acceleration near zero";
+  if (abs(int(s.ax)) >= 32700 || abs(int(s.ay)) >= 32700 || abs(int(s.az)) >= 32700)
+    return IMU_ACCEL_SATURATION;
+  if (abs(int(s.gx)) >= 32700 || abs(int(s.gy)) >= 32700 || abs(int(s.gz)) >= 32700)
+    return IMU_GYRO_SATURATION;
+  if (plane2 <= minAccelSquared) return IMU_PITCH_PLANE_LOW;
+  return nullptr;
+}
+void printImuReadDiagnostic(const ImuSample& s) {
+  const auto& d = mpu.diagnostic;
+  Serial.printf("IMU DETAIL: addr=0x%02X reg=0x%02X wire_code=%u received=%u expected=%u available=%d read_us=%lu\n",
+                unsigned(MPU6050_ADDRESS), unsigned(d.reg), unsigned(d.writeCode), unsigned(d.received),
+                unsigned(d.expected), d.available, static_cast<unsigned long>(mpuDurationUs));
+  if (d.writeCode == 0 && d.received == d.expected && d.available >= d.expected) {
+    Serial.printf("IMU SAMPLE: accel_raw=%d/%d/%d gyro_raw=%d/%d/%d pitch_axis=%c\n",
+                  s.ax, s.ay, s.az, s.gx, s.gy, s.gz, IMU_PITCH_AXIS);
+  }
 }
 bool initializeImu() {
   uint8_t identity = 0;
   if (!mpu.readBytes(0x75, &identity, 1)) {
-    Serial.printf("MPU6050 WHO_AM_I read failed: addr=0x%02X reg=0x%02X wire_code=%u received=%u expected=%u\n",
+    Serial.printf("MPU6050 I2C_ERROR: WHO_AM_I read failed addr=0x%02X reg=0x%02X wire_code=%u received=%u expected=%u\n",
                   unsigned(MPU6050_ADDRESS), unsigned(mpu.diagnostic.reg),
                   unsigned(mpu.diagnostic.writeCode), unsigned(mpu.diagnostic.received),
                   unsigned(mpu.diagnostic.expected));
@@ -227,17 +270,17 @@ bool initializeImu() {
   if (identity != 0x68)
     Serial.println("WARNING: unverified MPU6050-compatible identity; verify sensor output before use");
   if (!mpu.initialize()) {
-    Serial.printf("MPU6050 config failed: reg=0x%02X wire_code=%u received=%u expected=%u\n",
+    Serial.printf("MPU6050 I2C_ERROR: config failed reg=0x%02X wire_code=%u received=%u expected=%u\n",
                   unsigned(mpu.diagnostic.reg), unsigned(mpu.diagnostic.writeCode),
                   unsigned(mpu.diagnostic.received), unsigned(mpu.diagnostic.expected));
     return false;
   }
+  Serial.printf("IMU accel range configured: +/-%.0f g\n", 32768.0f / MpuArchiveAdapter::ACCEL_COUNTS_PER_G);
   delay(100);
   ImuSample s{};
-  if (!readImu(s)) {
-    Serial.printf("MPU6050 initial data read failed or out of range: wire_code=%u received=%u expected=%u\n",
-                  unsigned(mpu.diagnostic.writeCode), unsigned(mpu.diagnostic.received),
-                  unsigned(mpu.diagnostic.expected));
+  if (const char* error = readImu(s)) {
+    Serial.printf("Initial IMU sample failed: %s\n", error);
+    printImuReadDiagnostic(s);
     return false;
   }
   return true;
@@ -247,19 +290,20 @@ bool calibrateImu() {
   constexpr int SAMPLES = 300;
   double gyroSum = 0, gyroSquares = 0, sinSum = 0, cosSum = 0;
   float minAngle = 0, maxAngle = 0, firstAngle = 0;
-  Serial.println("CALIBRATE: hold upright and STILL for about 2 seconds; motors are disabled.");
+  Serial.println("CALIBRATE: hold the chassis upright with minimal motion for about 2 seconds to set pitch=0.");
   for (int i = 0; i < SAMPLES; ++i) {
     ImuSample s{};
-    if (!readImu(s)) {
-      Serial.printf("CALIBRATION FAILED sample=%d: I2C or invalid data reg=0x%02X wire_code=%u received=%u\n",
-                    i, unsigned(mpu.diagnostic.reg), unsigned(mpu.diagnostic.writeCode),
-                    unsigned(mpu.diagnostic.received));
+    if (const char* error = readImu(s)) {
+      Serial.printf("CALIBRATION FAILED sample=%d: %s\n", i, error);
+      printImuReadDiagnostic(s);
       return false;
     }
     const float g = rawGyro(s), angle = accelPitch(s);
-    const float norm = sqrtf(float(s.ax)*s.ax + float(s.ay)*s.ay + float(s.az)*s.az) / 16384.0f;
+    const float norm = sqrtf(float(s.ax)*s.ax + float(s.ay)*s.ay + float(s.az)*s.az) /
+                       MpuArchiveAdapter::ACCEL_COUNTS_PER_G;
     if (norm < 0.70f || norm > 1.40f) {
-      Serial.printf("CALIBRATION FAILED sample=%d: acceleration=%.3f g (allowed 0.70-1.40)\n", i, norm);
+      Serial.printf("CALIBRATION FAILED sample=%d: MPU6050 DATA_RANGE: acceleration=%.3f g (allowed 0.70-1.40)\n",
+                    i, norm);
       return false;
     }
     if (i == 0) firstAngle = angle;
@@ -277,28 +321,66 @@ bool calibrateImu() {
   const float angleSpan = maxAngle - minAngle;
   Serial.printf("CALIBRATION stats: gyro_mean=%.3f dps std=%.3f dps angle_span=%.3f deg\n",
                 gyroMean, gyroStd, angleSpan);
-  if (gyroStd > 1.5f || fabsf(gyroMean) > 10.0f || angleSpan > 30.0f) {
-    Serial.println("CALIBRATION FAILED: limits std<=1.5 dps mean<=10 dps angle_span<=30 deg");
+  if (gyroStd > 5.0f || fabsf(gyroMean) > 10.0f || angleSpan > 30.0f) {
+    Serial.println("CALIBRATION FAILED: limits std<=5.0 dps |mean|<=10 dps angle_span<=30 deg");
     return false;
   }
+  if (gyroStd > 1.5f) {
+    Serial.printf("CALIBRATION WARNING: gyro std=%.3f dps. Handheld calibration accepted.\n", gyroStd);
+  }
   gyroBias = mean;
-  pitchAngleDeg = atan2f(sinSum, cosSum) / BalanceMath::RAD_PER_DEG;
-  calibratedUprightDeg = balanceSetpointDeg = pitchAngleDeg;
+  imuPitchZeroDeg = atan2f(sinSum, cosSum) / BalanceMath::RAD_PER_DEG;
+  pitchAngleDeg = balanceSetpointDeg = 0;
   pitchRateDegPerSec = 0;
-  lastImuUs = lastControlUs = micros();
+  lastValidPitchAccelUs = lastControlUs = micros();
+  imuSettling = false;
   imuReady = true;
-  Serial.printf("IMU ready: pitch=%.2f deg, bias=%.2f deg/s\n", pitchAngleDeg, gyroBias/GYRO_SCALE);
+  Serial.printf("IMU ready: pitch=0.00 deg, raw_zero=%.2f deg, bias=%.2f deg/s\n",
+                imuPitchZeroDeg, gyroBias / GYRO_SCALE);
   return true;
 }
 bool updatePitch(float dt) {
   ImuSample s{};
-  if (!readImu(s)) return false;
+  const char* error = readImu(s);
+  const uint32_t sampleUs = micros();
+  const bool accelSaturated = error == IMU_ACCEL_SATURATION;
+  if (!driving() && (accelSaturated || error == IMU_GYRO_SATURATION)) {
+    lastImuSaturationUs = sampleUs;
+    if (!imuSettling) {
+      imuSettling = true;
+      Serial.printf("IMU WAIT: %s saturated while disarmed. Hold upright and still.\n",
+                    accelSaturated ? "accelerometer" : "gyroscope");
+      printImuReadDiagnostic(s);
+    }
+    return false;
+  }
+  const bool gyroOnly = error == IMU_PITCH_PLANE_LOW && armed &&
+                        sampleUs - lastValidPitchAccelUs <= MAX_GYRO_ONLY_US;
+  if (error && !gyroOnly) {
+    fault(error);
+    printImuReadDiagnostic(s);
+    return false;
+  }
   pitchRateDegPerSec = IMU_PITCH_SIGN * (rawGyro(s) - gyroBias) / GYRO_SCALE;
-  if (dt > MAX_CONTROL_GAP_US * 1.0e-6f) pitchAngleDeg = accelPitch(s);
-  else pitchAngleDeg = BalanceMath::fuseDeg(pitchAngleDeg, pitchRateDegPerSec,
-                                           accelPitch(s), dt, FILTER_TIME_CONSTANT);
-  lastImuUs = micros();
-  return isfinite(pitchAngleDeg) && isfinite(pitchRateDegPerSec);
+  if (gyroOnly) {
+    pitchAngleDeg = BalanceMath::wrapDeg(pitchAngleDeg + pitchRateDegPerSec * dt);
+  } else {
+    const float accelRelativeDeg = BalanceMath::wrapDeg(accelPitch(s) - imuPitchZeroDeg);
+    if (imuSettling || dt > MAX_CONTROL_GAP_US * 1.0e-6f) pitchAngleDeg = accelRelativeDeg;
+    else pitchAngleDeg = BalanceMath::fuseDeg(pitchAngleDeg, pitchRateDegPerSec,
+                                             accelRelativeDeg, dt, FILTER_TIME_CONSTANT);
+    lastValidPitchAccelUs = sampleUs;
+  }
+  if (!isfinite(pitchAngleDeg) || !isfinite(pitchRateDegPerSec)) {
+    fault("MPU6050 invalid pitch estimate");
+    printImuReadDiagnostic(s);
+    return false;
+  }
+  if (imuSettling && sampleUs - lastImuSaturationUs >= IMU_SETTLE_US) {
+    imuSettling = false;
+    Serial.println("IMU RECOVERED: sample ready. Motors disarmed.");
+  }
+  return true;
 }
 
 bool initializeMotor(BLDCMotor& motor, BLDCDriver3PWM& driver,
@@ -361,8 +443,17 @@ bool canStart() {
     Serial.println("Cannot start: autotune heartbeat expired.");
     return false;
   }
-  if (faultLatched || !motorsReady || !imuReady || leftSensor.failed || rightSensor.failed) {
+  if (faultLatched) {
+    Serial.printf("Cannot start: %s. Correct the fault and reset.\n", faultReason);
+    printEncoderDiagnostics();
+    return false;
+  }
+  if (!motorsReady || !imuReady || leftSensor.failed || rightSensor.failed) {
     Serial.println("Cannot start: initialization/sensor fault; check and reset.");
+    return false;
+  }
+  if (imuSettling) {
+    Serial.println("Cannot start: IMU is settling. Hold upright and still.");
     return false;
   }
   // Calibration can block for seconds. Refresh wheel feedback before arming.
@@ -371,7 +462,7 @@ bool canStart() {
     fault("MT6701 angle read"); printEncoderDiagnostics(); return false;
   }
   leftMotor.move(0); rightMotor.move(0);
-  if (micros() - lastImuUs > 15000 || !isfinite(pitchAngleDeg) ||
+  if (micros() - lastValidPitchAccelUs > 15000 || !isfinite(pitchAngleDeg) ||
       fabsf(BalanceMath::wrapDeg(pitchAngleDeg - balanceSetpointDeg)) > ARM_TILT_DEG ||
       !isfinite(pitchRateDegPerSec) || !isfinite(leftMotor.shaft_velocity) ||
       !isfinite(rightMotor.shaft_velocity) || fabsf(pitchRateDegPerSec) > 20.0f ||
@@ -427,8 +518,10 @@ void processSerial() {
     }
     if (c == 'L' || c == 'l' || c == 'R' || c == 'r') {
       if (canStart()) {
-        Serial.println("Wheel test: 0.5 V for 200 ms; wheels must be off the floor. X stops.");
         testWheel = (c == 'L' || c == 'l') ? 1 : 2;
+        Serial.printf("Wheel test: %s %.1f V for %lu ms. Keep wheels off the floor. X stops.\n",
+                      testWheel == 1 ? "LEFT" : "RIGHT", TEST_VOLTAGE,
+                      static_cast<unsigned long>(TEST_DURATION_MS));
         testStartMs = millis();
         if (testWheel == 1) leftMotor.enable(); else rightMotor.enable();
       }
@@ -442,10 +535,8 @@ void processSerial() {
       }
       return;
     }
-    if (c == '+') balanceSetpointDeg = BalanceMath::wrapDeg(calibratedUprightDeg +
-      BalanceMath::clamp(BalanceMath::wrapDeg(balanceSetpointDeg-calibratedUprightDeg)+0.1f, -5, 5));
-    else if (c == '-') balanceSetpointDeg = BalanceMath::wrapDeg(calibratedUprightDeg +
-      BalanceMath::clamp(BalanceMath::wrapDeg(balanceSetpointDeg-calibratedUprightDeg)-0.1f, -5, 5));
+    if (c == '+') balanceSetpointDeg = BalanceMath::clamp(balanceSetpointDeg + 0.1f, -5, 5);
+    else if (c == '-') balanceSetpointDeg = BalanceMath::clamp(balanceSetpointDeg - 0.1f, -5, 5);
     else if (c == '1') angleKp = fminf(60.0f, angleKp + 0.5f);
     else if (c == '0') angleKp = fmaxf(0.0f, angleKp - 0.5f);
     else if (c == '3') angleKd = fminf(5.0f, angleKd + 0.02f);
@@ -498,12 +589,16 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println("V1_06_TwoWheel_Balance_Car_new / ESP32 / SimpleFOC 2.3.3 / encoder diagnostics v2");
-  Serial.println("Left PWM 32/33/25 EN12 I2C21/22; Right PWM14/27/26 EN13 I2C19/18");
+  Serial.printf("Left PWM 32/33/25 EN12 I2C21/22; Right PWM14/27/26 EN13 I2C%d/%d\n",
+                RIGHT_I2C_SDA, RIGHT_I2C_SCL);
   Serial.println("MPU6050 shares LEFT hardware I2C SDA21/SCL22, AD0=GND");
+  Serial.printf("I2C clock: LEFT %lu kHz, RIGHT %lu kHz\n",
+                static_cast<unsigned long>(LEFT_I2C_HZ / 1000),
+                static_cast<unsigned long>(RIGHT_I2C_HZ / 1000));
   Serial.println("Commands: L/R=short wheel test A=balance X=stop C=calibrate +/-=trim");
   Serial.println("Disarmed tuning: 1/0=Kp +/-0.5, 5/4=Ki +/-0.1, 3/2=Kd +/-0.02, V=speed assist, ?=settings");
-  if (!Wire.begin(LEFT_I2C_SDA, LEFT_I2C_SCL, 400000) ||
-      !Wire1.begin(RIGHT_I2C_SDA, RIGHT_I2C_SCL, 400000)) {
+  if (!Wire.begin(LEFT_I2C_SDA, LEFT_I2C_SCL, LEFT_I2C_HZ) ||
+      !Wire1.begin(RIGHT_I2C_SDA, RIGHT_I2C_SCL, RIGHT_I2C_HZ)) {
     fault("I2C initialization"); return;
   }
   Wire.setTimeOut(3); Wire1.setTimeOut(3);
@@ -530,7 +625,11 @@ void setup() {
   if (!leftOk || !rightOk) {
     Serial.printf("Alignment summary: LEFT=%s RIGHT=%s\n", leftOk ? "OK" : "FAILED",
                   rightOk ? "OK" : (rightAttempted ? "FAILED" : "SKIPPED"));
-    fault("motor alignment; check phases, magnets, supply and pole pairs");
+    if (leftSensor.failed) fault("LEFT MT6701 I2C during FOC alignment");
+    else if (rightSensor.failed) fault("RIGHT MT6701 I2C during FOC alignment");
+    else if (leftOk) fault("RIGHT motor initialization or FOC alignment failed");
+    else if (rightOk) fault("LEFT motor initialization or FOC alignment failed");
+    else fault("both motor initializations or FOC alignments failed");
     printEncoderDiagnostics(); return;
   }
   motorsReady = true;
@@ -574,8 +673,6 @@ void loop() {
   if (!isfinite(leftMotor.shaft_velocity) || !isfinite(rightMotor.shaft_velocity)) {
     fault("invalid wheel speed"); return;
   }
-  if (driving() && (fabsf(leftMotor.shaft_velocity) > MAX_WHEEL_SPEED ||
-                    fabsf(rightMotor.shaft_velocity) > MAX_WHEEL_SPEED)) stopMotors("wheel overspeed");
 
   const uint32_t nowUs = micros(), elapsed = nowUs - lastControlUs;
   if (elapsed >= BALANCE_PERIOD_US) {
@@ -583,13 +680,13 @@ void loop() {
     lastControlUs = nowUs;
     const float dt = elapsed * 1.0e-6f;
     if (!updatePitch(dt)) {
-      fault("MPU6050 I2C read or data range");
+      if (!faultLatched) processSerial();
       return;
     }
-    if (driving() && fabsf(BalanceMath::wrapDeg(pitchAngleDeg-calibratedUprightDeg)) > MAX_TILT_DEG)
+    if (driving() && fabsf(pitchAngleDeg) > MAX_TILT_DEG)
       stopMotors("tilt limit");
     if (armed) updateBalanceControl(dt);
   }
   processSerial();
-  printTelemetry();
+  if (!imuSettling) printTelemetry();
 }

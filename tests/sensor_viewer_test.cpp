@@ -6,7 +6,7 @@
 int main() {
   setup();
   assert(Wire.sdaPin == 21 && Wire.sclPin == 22);
-  assert(Wire1.sdaPin == 19 && Wire1.sclPin == 18);
+  assert(Wire1.sdaPin == 17 && Wire1.sclPin == 16);
   float angle = NAN;
   Wire.registers[0x06][0x03] = 0x80;
   Wire.registers[0x06][0x04] = 0x00;
@@ -17,8 +17,9 @@ int main() {
   Wire.nackAddress = -1;
   Wire1.registers[0x06][0x03] = 0x40;
   Wire.registers[0x68][0x75] = 0x68;
-  Wire.registers[0x68][0x3F] = 0x40;
+  Wire.registers[0x68][0x3F] = 0x20;
   assert(startMpu());
+  assert(Wire.registers[0x68][0x1C] == 0x08);
   mpuReady = true;
   Serial.output.clear();
   sampleSensors();

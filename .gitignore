@@ -21,6 +21,10 @@ dist/
 *.map
 *.hex
 
+# Python caches
+__pycache__/
+*.pyc
+
 # MATLAB / Simulink generated caches
 **/slprj/
 *.slxc

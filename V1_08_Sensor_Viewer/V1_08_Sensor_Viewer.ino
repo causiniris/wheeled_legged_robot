@@ -75,8 +75,9 @@ void sampleSensors() {
   }
   Serial.printf("%lu,%.3f,%.3f,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%d,%d,%d\n",
                 static_cast<unsigned long>(millis()), left, right,
-                mpuOk ? ax / 16384.0f : NAN, mpuOk ? ay / 16384.0f : NAN,
-                mpuOk ? az / 16384.0f : NAN, mpuOk ? gx / 131.0f : NAN,
+                mpuOk ? ax / MpuArchiveAdapter::ACCEL_COUNTS_PER_G : NAN,
+                mpuOk ? ay / MpuArchiveAdapter::ACCEL_COUNTS_PER_G : NAN,
+                mpuOk ? az / MpuArchiveAdapter::ACCEL_COUNTS_PER_G : NAN, mpuOk ? gx / 131.0f : NAN,
                 mpuOk ? gy / 131.0f : NAN, mpuOk ? gz / 131.0f : NAN,
                 int(leftOk), int(rightOk), int(mpuOk));
 }
@@ -88,14 +89,14 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   Serial.println("# SENSOR VIEWER: motor EN12/EN13 LOW");
-  if (!Wire.begin(21, 22, 400000) || !Wire1.begin(19, 18, 400000)) {
+  if (!Wire.begin(21, 22, 400000) || !Wire1.begin(17, 16, 400000)) {
     Serial.println("# I2C initialization failed; reset after checking");
     return;
   }
   Wire.setTimeOut(3); Wire1.setTimeOut(3);
   busesReady = true;
   scan(Wire, "LEFT GPIO21/22");
-  scan(Wire1, "RIGHT GPIO19/18");
+  scan(Wire1, "RIGHT GPIO17/16");
   mpuReady = startMpu();
   lastMpuAttempt = millis();
   Serial.println("ms,left_deg,right_deg,ax_g,ay_g,az_g,gx_dps,gy_dps,gz_dps,left_ok,right_ok,mpu_ok");

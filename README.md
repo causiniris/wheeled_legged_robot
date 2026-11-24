@@ -2,9 +2,29 @@
 
 [中文说明](./README.zh-CN.md)
 
-An ESP32-based BLDC motor control project using SimpleFOC, a SimpleFOC mini 3PWM driver board, a 2804 gimbal motor,and an AS5600 magnetic encoder.
+ESP32 and SimpleFOC firmware for a fixed-leg, two-wheel balancing robot, with motor bring-up examples and control-model simulations.
 
-This repository documents a small but complete motor-control bring-up workflow: sensor validation, open-loop motor testing,and closed-loop velocity control.
+## Two-wheel balance firmware
+
+`balance_car_new` drives two 2804 motors with MT6701 encoders and uses a Z-axis IMU pitch estimate. The right encoder uses SDA GPIO17 and SCL GPIO16. The left encoder and IMU share SDA GPIO21 and SCL GPIO22. The speed loop targets zero wheel speed and adjusts the pitch reference by up to ±1°. See the [balance firmware guide](./README_balance_new.md) and the [wiring table](./WIRING_I2C_new.md).
+
+Support the chassis with both wheels off the ground before uploading or resetting. FOC alignment moves the wheels at startup. Close other serial monitors before opening the Viewer and replace `COM10` with the board's port.
+
+```powershell
+python -m pip install pyserial matplotlib
+pio run -e balance_car_new -t upload
+python tools/balance_viewer.py --port COM10
+```
+
+Use `CAL C` with the chassis upright, then verify the pitch and wheel directions. For a supported balance test, start with both wheels on the ground and stationary, then select `START A`. Use `STOP X` to stop the motors.
+
+- `sensor_viewer` reads both encoders and the IMU with the drivers disabled. See the [sensor diagnostic guide](./SENSOR_VIEWER.md).
+- `dual_motor_test_new` tests both motors independently of the IMU. See the [motor test guide](./README_new.md).
+- See the [Viewer guide](./BALANCE_VIEWER_TUNING.md) for telemetry and tuning, or the [model and gain calculations](./analysis/revised_motor_pid/balance_defaults.md) for the current defaults. The firmware builds and host tests cover the control and fault paths. The new gains still need validation under load on the robot.
+
+## Original AS5600 single-motor examples
+
+The original examples cover sensor validation, open-loop motor testing, and closed-loop velocity control with one 2804 motor and a SimpleFOC Mini 3PWM driver.
 
 ![Wiring diagram](./docs/wiring-diagram.png)
 
@@ -36,7 +56,7 @@ This repository documents a small but complete motor-control bring-up workflow: 
 | `V1_01_AS5600_Sensor_Test/` | Validate AS5600 angle and velocity readings |
 | `V1_02_2804_OpenLoop_Test/` | Test 2804 motor rotation without encoder feedback |
 | `V1_03_ClosedLoop_Velocity_Test/` | Run closed-loop velocity control with AS5600 feedback |
-| `platformio.ini` | PlatformIO build environments for the three sketches |
+| `platformio.ini` | Build environments for the motor examples, balance firmware, and diagnostics |
 | `BOM.md` | Bill of materials |
 | `DEPENDENCIES.md` | Arduino / ESP32 / SimpleFOC dependency notes |
 | `TROUBLESHOOTING.md` | Common bring-up issues and checks |
@@ -100,7 +120,7 @@ This repository documents a small but complete motor-control bring-up workflow: 
 
 ## PlatformIO
 
-This project includes three PlatformIO environments:
+The original single-motor examples use these PlatformIO environments.
 
 | Environment | Sketch |
 |---|---|

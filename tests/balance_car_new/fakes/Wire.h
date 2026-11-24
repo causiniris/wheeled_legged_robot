@@ -6,9 +6,15 @@ class TwoWire {
   int nackAddress = -1, shortReadAddress = -1;
   int nackCode = 2;
   int sdaPin = -1, sclPin = -1;
+  int clockHz = 0;
   bool lastStopByAddress[128]{};
   void (*requestHook)(uint8_t, uint8_t) = nullptr;
-  bool begin(int sda, int scl, int) { sdaPin = sda; sclPin = scl; return true; }
+  bool begin(int sda, int scl, int frequency) {
+    sdaPin = sda;
+    sclPin = scl;
+    clockHz = frequency;
+    return true;
+  }
   void setTimeOut(int) {}
   void beginTransmission(uint8_t address) { address_ = address; first_ = true; }
   void write(uint8_t value) {
