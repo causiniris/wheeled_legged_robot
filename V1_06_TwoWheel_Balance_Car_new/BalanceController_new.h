@@ -19,8 +19,10 @@
 #include "MPU6050_archive_adapter.h"
 
 namespace {
+// 左右电机驱动接线，依次为三相PWM输入与高电平使能EN。
 constexpr int LEFT_IN1 = 32, LEFT_IN2 = 33, LEFT_IN3 = 25, LEFT_EN = 12;
 constexpr int RIGHT_IN1 = 14, RIGHT_IN2 = 27, RIGHT_IN3 = 26, RIGHT_EN = 13;
+// 左MT6701和MPU6050共享21/22，地址分别0x06和0x68；右编码器独占19/18。
 constexpr int LEFT_I2C_SDA = 21, LEFT_I2C_SCL = 22;
 constexpr int RIGHT_I2C_SDA = 19, RIGHT_I2C_SCL = 18;
 constexpr uint8_t MPU6050_ADDRESS = 0x68;  // AD0=GND; use 0x69 if AD0=3.3V.
@@ -33,6 +35,7 @@ constexpr long PWM_FREQUENCY_HZ = 10000;
 // Configure the IMU rotation axis parallel to the wheel axle. Default: X axle,
 // Z points approximately up. If the axle is parallel to sensor Y, choose 'Y'.
 // The sign must make a physical forward lean read positive pitch AND rate.
+// 选择与车轮轴平行的陀螺仪轴。X/Y及正负号必须根据安装实测确认。
 constexpr char IMU_PITCH_AXIS = 'X';
 constexpr float IMU_PITCH_SIGN = 1.0f;
 // Each positive signed wheel command must propel the chassis forward.
@@ -47,10 +50,19 @@ static_assert(RIGHT_MOTOR_SIGN * RIGHT_MOTOR_SIGN == 1.0f, "Right sign must be +
 // Starting gains, not a measured tune for this chassis. Units: V/rad and V/(rad/s).
 // Upstream also uses a 2.9-ohm phase-resistance conversion; this firmware DOES NOT
 // assume that resistance, so the same numerical gains are not an equivalent tune.
+// 初始姿态PD增益：倾角误差决定扶正力度，角速度反馈用于抑制振荡。
+// 相对静止校准角度的目标偏移。+/-串口微调以此为中心，范围±5度。
+constexpr float TARGET_OFFSET_DEG = 0.0f;
+// 静止校准容忍轻微手抖；这几项仅用于校准，不改变运行时倾角保护。
+constexpr float CALIB_ANGLE_SPAN_DEG = 30.0f; // 校准期间最大角度跨度；按用户要求放宽至30度。
+constexpr float CALIB_GYRO_STD_DPS = 2.0f;    // 原0.8度/秒，角速度标准差。
+constexpr float CALIB_ACCEL_MIN_G = 0.80f;   // 原0.85g。
+constexpr float CALIB_ACCEL_MAX_G = 1.20f;   // 原1.15g。
 constexpr float INITIAL_ANGLE_KP = 8.8f, INITIAL_ANGLE_KD = 0.29f;
 constexpr float SPEED_KP = 0.20f; // deg / (wheel rad/s)
 constexpr float SPEED_KI = 0.05f; // deg / wheel rad, optional slow speed loop
 constexpr float MAX_SPEED_LEAN_DEG = 3.0f;
+// 相对校准直立姿态超过35度停止；启动前倾角误差需小于8度。
 constexpr float MAX_TILT_DEG = 35.0f, ARM_TILT_DEG = 8.0f;
 constexpr float MAX_WHEEL_SPEED = 30.0f; // rad/s; independent of SimpleFOC velocity_limit.
 constexpr float TEST_VOLTAGE = 0.5f;
@@ -197,14 +209,29 @@ bool readImu(ImuSample& s) {
   const uint32_t start = micros();
   const bool readOk = mpu.getMotion6(s.ax, s.ay, s.az, s.gx, s.gy, s.gz);
   mpuDurationUs = micros() - start;
-  if (!readOk) return false;
+  if (!readOk) {
+    cutEnablePins(); // 先关闭功率输出，再打印日志，避免串口等待期间继续输出。
+    Serial.printf("IMU_READ_FAIL addr=0x%02X reg=0x%02X wire_code=%u received=%u expected=%u duration_us=%lu\n",
+      unsigned(MPU6050_ADDRESS),unsigned(mpu.diagnostic.reg),unsigned(mpu.diagnostic.writeCode),
+      unsigned(mpu.diagnostic.received),unsigned(mpu.diagnostic.expected),static_cast<unsigned long>(mpuDurationUs));
+    return false;
+  }
   const float norm2 = float(s.ax) * s.ax + float(s.ay) * s.ay + float(s.az) * s.az;
   const float plane2 = (IMU_PITCH_AXIS == 'X' ? float(s.ay) * s.ay : float(s.ax) * s.ax)
                        + float(s.az) * s.az;
-  // Reject zero/free-fall data, saturated sensors and an almost-vertical axle.
-  return norm2 > 2684354.0f && plane2 > 2684354.0f &&
-         abs(int(s.ax)) < 32700 && abs(int(s.ay)) < 32700 && abs(int(s.az)) < 32700 &&
-         abs(int(s.gx)) < 32700 && abs(int(s.gy)) < 32700 && abs(int(s.gz)) < 32700;
+  // 区分加速度异常、姿态轴不合适和传感器饱和，不把它们混称为通信失败。
+  const bool gravityOk = norm2 > 2684354.0f;
+  const bool planeOk = plane2 > 2684354.0f;
+  const bool saturated = abs(int(s.ax)) >= 32700 || abs(int(s.ay)) >= 32700 || abs(int(s.az)) >= 32700 ||
+                         abs(int(s.gx)) >= 32700 || abs(int(s.gy)) >= 32700 || abs(int(s.gz)) >= 32700;
+  if (!gravityOk || !planeOk || saturated) {
+    cutEnablePins();
+    Serial.printf("IMU_DATA_FAIL gravity_ok=%d plane_ok=%d saturated=%d accel_g=%.3f plane_g=%.3f axis=%c ax=%d ay=%d az=%d gx=%d gy=%d gz=%d\n",
+      gravityOk,planeOk,saturated,sqrtf(norm2)/16384.0f,sqrtf(plane2)/16384.0f,IMU_PITCH_AXIS,
+      int(s.ax),int(s.ay),int(s.az),int(s.gx),int(s.gy),int(s.gz));
+    return false;
+  }
+  return true;
 }
 bool initializeImu() {
   uint8_t identity = 0;
@@ -238,6 +265,7 @@ bool initializeImu() {
   }
   return true;
 }
+// 校准时需扶住车身直立并静止，估计陀螺仪零偏和直立角度。
 bool calibrateImu() {
   constexpr int SAMPLES = 300;
   double gyroSum = 0, gyroSquares = 0, sinSum = 0, cosSum = 0;
@@ -245,10 +273,17 @@ bool calibrateImu() {
   Serial.println("CALIBRATE: hold upright and STILL for about 2 seconds; motors are disabled.");
   for (int i = 0; i < SAMPLES; ++i) {
     ImuSample s{};
-    if (!readImu(s)) return false;
+    if (!readImu(s)) {
+      Serial.printf("CALIBRATE FAIL: IMU read sample=%d wire_code=%u received=%u expected=%u\n",
+                    i,unsigned(mpu.diagnostic.writeCode),unsigned(mpu.diagnostic.received),unsigned(mpu.diagnostic.expected));
+      return false;
+    }
     const float g = rawGyro(s), angle = accelPitch(s);
     const float norm = sqrtf(float(s.ax)*s.ax + float(s.ay)*s.ay + float(s.az)*s.az) / 16384.0f;
-    if (norm < 0.85f || norm > 1.15f) return false;
+    if (norm < CALIB_ACCEL_MIN_G || norm > CALIB_ACCEL_MAX_G) {
+      Serial.printf("CALIBRATE FAIL: accel=%.3fg allowed=%.2f..%.2fg\n",norm,CALIB_ACCEL_MIN_G,CALIB_ACCEL_MAX_G);
+      return false;
+    }
     if (i == 0) firstAngle = angle;
     const float relative = BalanceMath::wrapDeg(angle - firstAngle);
     minAngle = fminf(minAngle, relative); maxAngle = fmaxf(maxAngle, relative);
@@ -259,17 +294,26 @@ bool calibrateImu() {
   }
   const double mean = gyroSum / SAMPLES;
   const double variance = fmax(0.0, gyroSquares / SAMPLES - mean * mean);
-  if (sqrt(variance) / GYRO_SCALE > 0.8 || fabs(mean) / GYRO_SCALE > 10.0 ||
-      maxAngle - minAngle > 2.0f) return false;
+  const float gyroStd = sqrt(variance) / GYRO_SCALE;
+  const float gyroMean = fabs(mean) / GYRO_SCALE;
+  const float angleSpan = maxAngle - minAngle;
+  Serial.printf("CALIBRATE measured: angle_span=%.2f/%.2f deg gyro_std=%.2f/%.2f dps gyro_mean=%.2f/10 dps\n",
+                angleSpan,CALIB_ANGLE_SPAN_DEG,gyroStd,CALIB_GYRO_STD_DPS,gyroMean);
+  if (gyroStd > CALIB_GYRO_STD_DPS || gyroMean > 10.0f || angleSpan > CALIB_ANGLE_SPAN_DEG) {
+    Serial.println("CALIBRATE FAIL: motion exceeds calibration tolerance");
+    return false;
+  }
   gyroBias = mean;
   pitchAngleDeg = atan2f(sinSum, cosSum) / BalanceMath::RAD_PER_DEG;
-  calibratedUprightDeg = balanceSetpointDeg = pitchAngleDeg;
+  calibratedUprightDeg = pitchAngleDeg;
+  balanceSetpointDeg = BalanceMath::wrapDeg(calibratedUprightDeg + TARGET_OFFSET_DEG);
   pitchRateDegPerSec = 0;
   lastImuUs = lastControlUs = micros();
   imuReady = true;
   Serial.printf("IMU ready: pitch=%.2f deg, bias=%.2f deg/s\n", pitchAngleDeg, gyroBias/GYRO_SCALE);
   return true;
 }
+// 加速度提供长期倾角参考，陀螺仪提供快速变化，两者按时间常数互补融合。
 bool updatePitch(float dt) {
   ImuSample s{};
   if (!readImu(s)) return false;
@@ -278,9 +322,15 @@ bool updatePitch(float dt) {
   else pitchAngleDeg = BalanceMath::fuseDeg(pitchAngleDeg, pitchRateDegPerSec,
                                            accelPitch(s), dt, FILTER_TIME_CONSTANT);
   lastImuUs = micros();
-  return isfinite(pitchAngleDeg) && isfinite(pitchRateDegPerSec);
+  if (!isfinite(pitchAngleDeg) || !isfinite(pitchRateDegPerSec)) {
+    cutEnablePins();
+    Serial.printf("IMU_FILTER_FAIL pitch=%.3f rate=%.3f dt=%.6f\n",pitchAngleDeg,pitchRateDegPerSec,dt);
+    return false;
+  }
+  return true;
 }
 
+// 每侧根据编码器执行FOC对齐，获得电角度零位与传感器方向。
 bool initializeMotor(BLDCMotor& motor, BLDCDriver3PWM& driver,
                      CheckedMT6701& sensor, bool& linked, const char* label) {
   motor.linkSensor(&sensor);
@@ -335,6 +385,7 @@ bool initializeMotor(BLDCMotor& motor, BLDCDriver3PWM& driver,
   return true;
 }
 
+// 启动条件：传感器与两电机有效、车身接近直立、车轮停止、姿态数据新鲜。
 bool canStart() {
   if (driving()) return false;
   if (faultLatched || !motorsReady || !imuReady || leftSensor.failed || rightSensor.failed) {
@@ -363,6 +414,7 @@ void showSettings() {
     angleKp, angleKd, speedAssist, balanceSetpointDeg, IMU_PITCH_AXIS,
     IMU_PITCH_SIGN, LEFT_MOTOR_SIGN, RIGHT_MOTOR_SIGN);
 }
+// 串口命令：A进入平衡、X停止、L/R短测方向、C静止校准；运行中仅处理X。
 void processSerial() {
   // Bound serial work; no readString()/parseFloat() or unbounded serial draining.
   for (int n = 0; n < 16 && Serial.available() > 0; ++n) {
@@ -393,10 +445,10 @@ void processSerial() {
       }
       return;
     }
-    if (c == '+') balanceSetpointDeg = BalanceMath::wrapDeg(calibratedUprightDeg +
-      BalanceMath::clamp(BalanceMath::wrapDeg(balanceSetpointDeg-calibratedUprightDeg)+0.1f, -5, 5));
-    else if (c == '-') balanceSetpointDeg = BalanceMath::wrapDeg(calibratedUprightDeg +
-      BalanceMath::clamp(BalanceMath::wrapDeg(balanceSetpointDeg-calibratedUprightDeg)-0.1f, -5, 5));
+    if (c == '+') balanceSetpointDeg = BalanceMath::wrapDeg(calibratedUprightDeg + TARGET_OFFSET_DEG +
+      BalanceMath::clamp(BalanceMath::wrapDeg(balanceSetpointDeg-calibratedUprightDeg-TARGET_OFFSET_DEG)+0.1f, -5, 5));
+    else if (c == '-') balanceSetpointDeg = BalanceMath::wrapDeg(calibratedUprightDeg + TARGET_OFFSET_DEG +
+      BalanceMath::clamp(BalanceMath::wrapDeg(balanceSetpointDeg-calibratedUprightDeg-TARGET_OFFSET_DEG)-0.1f, -5, 5));
     else if (c == '1') angleKp = fminf(60.0f, angleKp + 0.5f);
     else if (c == '0') angleKp = fmaxf(0.0f, angleKp - 0.5f);
     else if (c == '3') angleKd = fminf(5.0f, angleKd + 0.02f);
@@ -407,6 +459,7 @@ void processSerial() {
     return; // At most one reply per control iteration.
   }
 }
+// 用当前姿态与目标姿态计算电压指令。速度辅助开启时，小幅调整目标倾角。
 void updateBalanceControl(float dt) {
   const float wheelSpeed = 0.5f * (LEFT_MOTOR_SIGN * leftMotor.shaft_velocity +
                                  RIGHT_MOTOR_SIGN * rightMotor.shaft_velocity);
@@ -417,6 +470,7 @@ void updateBalanceControl(float dt) {
                                         pitchRateDegPerSec, angleKp, angleKd, MOTOR_VOLTAGE_LIMIT);
   if (!isfinite(balanceVoltage)) fault("non-finite controller output");
 }
+// 输出pitch(倾角)、set(目标角)、rate(角速度)、wl/wr(轮速)、u(电压)和故障标志。
 void printTelemetry() {
   const uint32_t now = millis();
   if (now - lastTelemetryMs < TELEMETRY_PERIOD_MS) return;
@@ -436,6 +490,7 @@ void printTelemetry() {
 }
 } // namespace
 
+// 启动流程：关闭驱动→初始化编码器/MPU→校准两电机→静止校准姿态→等待A。
 void setup() {
   // EN is active HIGH on SimpleFOC Mini. GPIO12 is a boot strap pin inherited
   // from the homework: external circuitry must not force it HIGH at ESP32 reset.
@@ -454,7 +509,19 @@ void setup() {
     fault("I2C initialization"); return;
   }
   Wire.setTimeOut(10); Wire1.setTimeOut(10);
-  leftSensor.init(); rightSensor.init();
+  // 上电通信有限重试，仅在驱动关闭阶段进行；运行中故障仍立即停机。
+  delay(100);
+  for (int attempt=1; attempt<=5; ++attempt) {
+    processSerial();
+    if (faultLatched) return;
+    leftSensor.failed=rightSensor.failed=false;
+    leftSensor.failure=rightSensor.failure=CheckedMT6701::Failure::none;
+    leftSensor.init(); rightSensor.init();
+    if (!leftSensor.failed && !rightSensor.failed) break;
+    Serial.printf("Encoder startup attempt %d/5 failed.\n",attempt);
+    printEncoderDiagnostics(true);
+    delay(50);
+  }
   if (leftSensor.failed || rightSensor.failed) {
     fault("MT6701 angle initialization"); printEncoderDiagnostics(true); return;
   }
@@ -489,6 +556,7 @@ void setup() {
   Serial.println("Ready but disarmed. Verify pitch and L/R direction before A.");
 }
 
+// 持续执行FOC，按5ms周期更新姿态与平衡输出，并检查倾角/超速/通信/超时保护。
 void loop() {
   if (!motorsReady || !imuReady || faultLatched) {
     processSerial();
